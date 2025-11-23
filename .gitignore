@@ -9,6 +9,7 @@ __pycache__/
 *.pyc
 
 # Editor/system files
+.vscode/
 .idea/
 .DS_Store
 *.swp
