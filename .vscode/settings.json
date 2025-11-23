@@ -1,0 +1,26 @@
+{
+    "python.autoComplete.extraPaths": [
+        "/home/erds/dobot_v4/install/dobot_msgs_v4/local/lib/python3.10/dist-packages",
+        "/home/erds/ros2_ws/install/orbbec_camera_msgs/local/lib/python3.10/dist-packages",
+        "/home/erds/barns_ws/install/servo_action/lib/python3.10/site-packages",
+        "/home/erds/barns_ws/install/pymoveit2/local/lib/python3.10/dist-packages",
+        "/home/erds/barns_ws/install/pickn_place/lib/python3.10/site-packages",
+        "/home/erds/barns_ws/install/dobot_bringup_v3/lib/python3.10/site-packages",
+        "/home/erds/barns_ws/install/dobot_msgs_v3/local/lib/python3.10/dist-packages",
+        "/home/erds/barns_ws/install/dobot_moveit/lib/python3.10/site-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/erds/dobot_v4/install/dobot_msgs_v4/local/lib/python3.10/dist-packages",
+        "/home/erds/ros2_ws/install/orbbec_camera_msgs/local/lib/python3.10/dist-packages",
+        "/home/erds/barns_ws/install/servo_action/lib/python3.10/site-packages",
+        "/home/erds/barns_ws/install/pymoveit2/local/lib/python3.10/dist-packages",
+        "/home/erds/barns_ws/install/pickn_place/lib/python3.10/site-packages",
+        "/home/erds/barns_ws/install/dobot_bringup_v3/lib/python3.10/site-packages",
+        "/home/erds/barns_ws/install/dobot_msgs_v3/local/lib/python3.10/dist-packages",
+        "/home/erds/barns_ws/install/dobot_moveit/lib/python3.10/site-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ]
+}
