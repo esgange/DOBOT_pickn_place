@@ -34,13 +34,24 @@ ament_target_dependencies(eye_on_hand_calibrator
   OpenCV
 )
 
+add_executable(calibration_perception src/calibration_perception.cpp)
+ament_target_dependencies(calibration_perception
+  rclcpp
+  geometry_msgs
+  tf2
+  tf2_geometry_msgs
+  tf2_ros
+)
+
 install(TARGETS eye_on_hand_calibrator
+  DESTINATION lib/${PROJECT_NAME})
+install(TARGETS calibration_perception
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY include/
   DESTINATION include)
 
-install(DIRECTORY launch config
+install(DIRECTORY launch calib
   DESTINATION share/${PROJECT_NAME})
 
 ament_python_install_package(camera_calibration_gui

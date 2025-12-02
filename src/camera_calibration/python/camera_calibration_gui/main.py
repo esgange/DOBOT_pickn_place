@@ -1,13 +1,27 @@
-import os
 import subprocess
 import sys
+from datetime import datetime
 from functools import partial
+from pathlib import Path
 
 from python_qt_binding import QtCore, QtWidgets
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_services_default
+from ament_index_python.packages import get_package_share_directory
 from std_srvs.srv import Trigger
+
+
+def default_output_path():
+  try:
+    share = Path(get_package_share_directory("camera_calibration"))
+    calib_dir = share / "calib"
+    calib_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%d%m%Y")
+    return str(calib_dir / f"axab_calibration_{stamp}.yaml")
+  except Exception:
+    stamp = datetime.now().strftime("%d%m%Y")
+    return str(Path.home() / f"axab_calibration_{stamp}.yaml")
 
 
 class CalibGui(QtWidgets.QWidget):
@@ -17,16 +31,17 @@ class CalibGui(QtWidgets.QWidget):
     self.calib_process = None
     self.setWindowTitle("Camera Calibration (Eye-on-Hand)")
     self._build_ui()
+    self._setup_monitors()
 
   def _build_ui(self):
     layout = QtWidgets.QVBoxLayout()
 
     form = QtWidgets.QFormLayout()
     self.base_frame = QtWidgets.QLineEdit("base_link")
-    self.gripper_frame = QtWidgets.QLineEdit("link6")
+    self.gripper_frame = QtWidgets.QLineEdit("Link6")
     self.camera_frame = QtWidgets.QLineEdit("camera_link")
     self.target_frame = QtWidgets.QLineEdit("tag_frame")
-    self.output_path = QtWidgets.QLineEdit(os.path.expanduser("~/axab_calibration.yaml"))
+    self.output_path = QtWidgets.QLineEdit(default_output_path())
     self.min_samples = QtWidgets.QSpinBox()
     self.min_samples.setMinimum(3)
     self.min_samples.setMaximum(1000)
@@ -75,6 +90,13 @@ class CalibGui(QtWidgets.QWidget):
   def log(self, text):
     self.status.appendPlainText(text)
 
+  def _setup_monitors(self):
+    # Poll calibrator subprocess; if it exits (e.g., user stops it externally), close the GUI.
+    self.process_watch = QtCore.QTimer(self)
+    self.process_watch.setInterval(300)
+    self.process_watch.timeout.connect(self._check_calibrator_process)
+    self.process_watch.start()
+
   def start_calibrator(self):
     if self.calib_process is not None:
       self.log("Calibrator already running.")
@@ -114,15 +136,29 @@ class CalibGui(QtWidgets.QWidget):
       self.log("Calibrator is not running.")
       return
     self.log("Stopping calibrator...")
-    self.calib_process.terminate()
     try:
-      self.calib_process.wait(timeout=3.0)
-    except subprocess.TimeoutExpired:
-      self.calib_process.kill()
+      self.calib_process.terminate()
+      try:
+        self.calib_process.wait(timeout=3.0)
+      except subprocess.TimeoutExpired:
+        self.calib_process.kill()
+    finally:
+      self.calib_process = None
+      self.start_btn.setEnabled(True)
+      self.stop_btn.setEnabled(False)
+      self.log("Calibrator stopped.")
+
+  def _check_calibrator_process(self):
+    if self.calib_process is None:
+      return
+    if self.calib_process.poll() is None:
+      return
+    # Process exited on its own; mirror UI state and close GUI so launch shuts down cleanly.
+    self.log("Calibrator process exited; closing GUI.")
     self.calib_process = None
     self.start_btn.setEnabled(True)
     self.stop_btn.setEnabled(False)
-    self.log("Calibrator stopped.")
+    QtWidgets.QApplication.instance().quit()
 
   def _call_trigger(self, service_name):
     def done_callback(future):
@@ -151,16 +187,16 @@ class CalibGui(QtWidgets.QWidget):
 class RosInterface(Node):
   def __init__(self):
     super().__init__("camera_calibration_gui")
-    self._clients = {}
+    self._client_map = {}
 
   def get_client(self, service_name):
-    if service_name in self._clients:
-      return self._clients[service_name]
+    if service_name in self._client_map:
+      return self._client_map[service_name]
     client = self.create_client(Trigger, service_name, qos_profile=qos_profile_services_default)
     if not client.wait_for_service(timeout_sec=0.5):
       self.get_logger().warn(f"Service {service_name} not available")
       return None
-    self._clients[service_name] = client
+    self._client_map[service_name] = client
     return client
 
 
@@ -175,7 +211,13 @@ def main(args=None):
 
   # Periodically spin rclpy to service clients
   timer = QtCore.QTimer()
-  timer.timeout.connect(lambda: rclpy.spin_once(ros_if, timeout_sec=0.01))
+  def spin_once():
+    if not rclpy.ok():
+      QtWidgets.QApplication.instance().quit()
+      return
+    rclpy.spin_once(ros_if, timeout_sec=0.01)
+
+  timer.timeout.connect(spin_once)
   timer.start(10)
 
   ret = app.exec_()

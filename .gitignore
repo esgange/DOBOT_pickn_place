@@ -8,6 +8,10 @@ devel/
 __pycache__/
 *.pyc
 
+# Calibration outputs
+src/camera_calibration/calib/axab_calibration_*.yaml
+!src/camera_calibration/calib/axab_calibration_01011970.yaml
+
 # Editor/system files
 .vscode/
 .idea/

@@ -14,8 +14,10 @@
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
+#include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Quaternion.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <rmw/qos_profiles.h>
 
 using std::placeholders::_1;
@@ -26,31 +28,45 @@ namespace camera_calibration
 EyeOnHandCalibrator::EyeOnHandCalibrator()
 : rclcpp::Node("eye_on_hand_calibrator")
 {
-  std::string default_output = "axab_calibration.yaml";
+  const auto now = std::chrono::system_clock::now();
+  const std::time_t time_now = std::chrono::system_clock::to_time_t(now);
+  std::tm tm = *std::localtime(&time_now);
+  std::ostringstream fname;
+  fname << "axab_calibration_" << std::put_time(&tm, "%d%m%Y") << ".yaml";
+
+  std::string default_output = fname.str();
   try
   {
     auto share = std::filesystem::path(
       ament_index_cpp::get_package_share_directory("camera_calibration"));
-    default_output = (share / "config" / "axab_calibration.yaml").string();
+    auto calib_dir = share / "calib";
+    std::filesystem::create_directories(calib_dir);
+
+    default_output = (calib_dir / fname.str()).string();
   }
   catch (const std::exception &ex)
   {
     RCLCPP_WARN(get_logger(),
-                "Could not resolve package share directory, defaulting output to handeye.yaml (%s)",
-                ex.what());
+                "Could not resolve package share directory, defaulting output to %s (%s)",
+                default_output.c_str(), ex.what());
   }
 
   output_path_ = this->declare_parameter<std::string>("output_path", default_output);
   base_frame_ = this->declare_parameter<std::string>("base_frame", "base_link");
-  gripper_frame_ = this->declare_parameter<std::string>("gripper_frame", "link6");
+  gripper_frame_ = this->declare_parameter<std::string>("gripper_frame", "Link6");
   camera_frame_ = this->declare_parameter<std::string>("camera_frame", "camera_link");
   target_frame_ = this->declare_parameter<std::string>("target_frame", "tag_frame");
   min_samples_ = this->declare_parameter<int>("min_samples", 8);
 
   RCLCPP_INFO(get_logger(), "Writing calibration output to: %s", output_path_.c_str());
+  RCLCPP_INFO(get_logger(),
+              "Using frames base=%s, gripper=%s, camera=%s, target=%s (min_samples=%d)",
+              base_frame_.c_str(), gripper_frame_.c_str(),
+              camera_frame_.c_str(), target_frame_.c_str(), min_samples_);
 
   tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+  static_broadcaster_ = std::make_shared<tf2_ros::StaticTransformBroadcaster>(this);
 
   service_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   add_sample_srv_ = this->create_service<std_srvs::srv::Trigger>(
@@ -97,6 +113,9 @@ void EyeOnHandCalibrator::handleAddSample(const std::shared_ptr<std_srvs::srv::T
   has_solution_ = false;
   res->success = true;
   res->message = "Sample recorded. Total: " + std::to_string(samples_.size());
+  RCLCPP_INFO(get_logger(), "Sample %zu recorded using frames (base=%s, gripper=%s, camera=%s, target=%s)",
+              samples_.size(), base_frame_.c_str(), gripper_frame_.c_str(),
+              camera_frame_.c_str(), target_frame_.c_str());
 }
 
 void EyeOnHandCalibrator::handleReset(const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/,
@@ -111,27 +130,43 @@ void EyeOnHandCalibrator::handleReset(const std::shared_ptr<std_srvs::srv::Trigg
 
 bool EyeOnHandCalibrator::fetchTransforms(PoseSample &sample, std::string &reason)
 {
+  geometry_msgs::msg::TransformStamped t_base_gripper;
+  geometry_msgs::msg::TransformStamped t_camera_target;
   try
   {
-    auto t_base_gripper = tf_buffer_->lookupTransform(base_frame_, gripper_frame_, tf2::TimePointZero);
-    auto t_camera_target = tf_buffer_->lookupTransform(camera_frame_, target_frame_, tf2::TimePointZero);
-
-    geometry_msgs::msg::PoseStamped ee_pose;
-    ee_pose.header = t_base_gripper.header;
-    ee_pose.pose = tf2::toMsg(tf2::transformToEigen(t_base_gripper));
-
-    geometry_msgs::msg::PoseStamped target_pose;
-    target_pose.header = t_camera_target.header;
-    target_pose.pose = tf2::toMsg(tf2::transformToEigen(t_camera_target));
-
-    sample.end_effector = ee_pose;
-    sample.target = target_pose;
+    t_base_gripper = tf_buffer_->lookupTransform(
+      base_frame_, gripper_frame_, tf2::TimePointZero);
   }
   catch (const tf2::TransformException &ex)
   {
-    reason = std::string("TF lookup failed: ") + ex.what();
+    reason = "TF lookup failed for base->gripper (" + base_frame_ + " -> " + gripper_frame_ +
+             "): " + ex.what();
+    RCLCPP_WARN(get_logger(), "%s", reason.c_str());
     return false;
   }
+  try
+  {
+    t_camera_target = tf_buffer_->lookupTransform(
+      camera_frame_, target_frame_, tf2::TimePointZero);
+  }
+  catch (const tf2::TransformException &ex)
+  {
+    reason = "TF lookup failed for camera->target (" + camera_frame_ + " -> " + target_frame_ +
+             "): " + ex.what();
+    RCLCPP_WARN(get_logger(), "%s", reason.c_str());
+    return false;
+  }
+
+  geometry_msgs::msg::PoseStamped ee_pose;
+  ee_pose.header = t_base_gripper.header;
+  ee_pose.pose = tf2::toMsg(tf2::transformToEigen(t_base_gripper));
+
+  geometry_msgs::msg::PoseStamped target_pose;
+  target_pose.header = t_camera_target.header;
+  target_pose.pose = tf2::toMsg(tf2::transformToEigen(t_camera_target));
+
+  sample.end_effector = ee_pose;
+  sample.target = target_pose;
   return true;
 }
 
@@ -236,7 +271,22 @@ bool EyeOnHandCalibrator::writeResultYAML(const Eigen::Matrix3d &rotation,
                                           const std::string &gripper_frame,
                                           size_t sample_count) const
 {
-  std::ofstream out(output_path_);
+  const std::filesystem::path output_path(output_path_);
+  try
+  {
+    const auto parent = output_path.parent_path();
+    if (!parent.empty())
+    {
+      std::filesystem::create_directories(parent);
+    }
+  }
+  catch (const std::exception &ex)
+  {
+    RCLCPP_ERROR(get_logger(), "Failed to prepare output directory: %s", ex.what());
+    return false;
+  }
+
+  std::ofstream out(output_path);
   if (!out.good())
   {
     RCLCPP_ERROR(get_logger(), "Failed to open output file: %s", output_path_.c_str());
@@ -366,9 +416,25 @@ void EyeOnHandCalibrator::handleSave(const std::shared_ptr<std_srvs::srv::Trigge
     return;
   }
 
+  geometry_msgs::msg::TransformStamped tf_msg;
+  tf_msg.header.stamp = this->now();
+  tf_msg.header.frame_id = gripper_frame_;  // enforce configured gripper frame (e.g., Link6)
+  // Publish a static frame to visualize the calibrated camera pose
+  const std::string calibrated_frame = "calibrated_camera_link";
+  tf_msg.child_frame_id = calibrated_frame;
+  tf_msg.transform.translation.x = t.x();
+  tf_msg.transform.translation.y = t.y();
+  tf_msg.transform.translation.z = t.z();
+  Eigen::Quaterniond q(R);
+  q.normalize();
+  tf2::Quaternion tf_q(q.x(), q.y(), q.z(), q.w());
+  tf_msg.transform.rotation = tf2::toMsg(tf_q);
+  static_broadcaster_->sendTransform(tf_msg);
+
   res->success = true;
   std::ostringstream oss;
-  oss << "Saved cached calibration to " << output_path_ << " using " << used_samples << " samples.";
+  oss << "Saved cached calibration to " << output_path_ << " using " << used_samples
+      << " samples. Broadcasted static TF " << gripper_frame << " -> " << calibrated_frame << ".";
   res->message = oss.str();
 }
 }  // namespace camera_calibration

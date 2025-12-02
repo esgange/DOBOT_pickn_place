@@ -6,7 +6,7 @@
       "ip_address": "192.168.200.200",
       "robot_type": "nova5",
       "trajectory_duration": 0.3,
-      "robot_node_name": "nova5"
+      "robot_node_name": "milk_robot"
     }
   ]
 }
