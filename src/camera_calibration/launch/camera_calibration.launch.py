@@ -3,8 +3,8 @@ import os
 from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from ament_index_python.packages import get_package_share_directory
 from launch_ros.actions import Node
+from ament_index_python.packages import get_package_share_directory
 
 
 def generate_launch_description():
@@ -32,8 +32,10 @@ def generate_launch_description():
 
     aruco_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
-            os.path.join(get_package_share_directory('aruco_perception'),
-                         'launch', 'aruco_perception.launch.py')),
+            os.path.join(
+                get_package_share_directory('aruco_perception'),
+                'launch',
+                'aruco_perception.launch.py')),
         launch_arguments={
             'use_calibration': 'false',
             'parent_frame': 'Link6',

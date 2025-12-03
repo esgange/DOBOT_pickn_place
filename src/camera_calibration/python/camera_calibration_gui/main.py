@@ -8,20 +8,17 @@ from python_qt_binding import QtCore, QtWidgets
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_services_default
-from ament_index_python.packages import get_package_share_directory
 from std_srvs.srv import Trigger
 
 
 def default_output_path():
+  stamp = datetime.now().strftime("%d%m%Y")
+  calib_dir = Path.home() / "DOBOT_pickn_place" / "calibration"
   try:
-    share = Path(get_package_share_directory("camera_calibration"))
-    calib_dir = share / "calib"
     calib_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%d%m%Y")
-    return str(calib_dir / f"axab_calibration_{stamp}.yaml")
   except Exception:
-    stamp = datetime.now().strftime("%d%m%Y")
-    return str(Path.home() / f"axab_calibration_{stamp}.yaml")
+    pass
+  return str(calib_dir / f"axab_calibration_{stamp}.yaml")
 
 
 class CalibGui(QtWidgets.QWidget):

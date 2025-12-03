@@ -7,9 +7,9 @@
 #include <iomanip>
 #include <sstream>
 #include <cmath>
+#include <cstdlib>
 
 #include <Eigen/Geometry>
-#include <ament_index_cpp/get_package_share_directory.hpp>
 #include <opencv2/calib3d.hpp>
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <tf2_ros/buffer.h>
@@ -37,17 +37,18 @@ EyeOnHandCalibrator::EyeOnHandCalibrator()
   std::string default_output = fname.str();
   try
   {
-    auto share = std::filesystem::path(
-      ament_index_cpp::get_package_share_directory("camera_calibration"));
-    auto calib_dir = share / "calib";
-    std::filesystem::create_directories(calib_dir);
-
-    default_output = (calib_dir / fname.str()).string();
+    const char * home = std::getenv("HOME");
+    if (home != nullptr)
+    {
+      auto calib_dir = std::filesystem::path(home) / "DOBOT_pickn_place" / "calibration";
+      std::filesystem::create_directories(calib_dir);
+      default_output = (calib_dir / fname.str()).string();
+    }
   }
   catch (const std::exception &ex)
   {
     RCLCPP_WARN(get_logger(),
-                "Could not resolve package share directory, defaulting output to %s (%s)",
+                "Could not resolve calibration directory in HOME, defaulting output to %s (%s)",
                 default_output.c_str(), ex.what());
   }
 

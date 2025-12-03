@@ -13,7 +13,6 @@ find_package(tf2 REQUIRED)
 find_package(tf2_eigen REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
-find_package(ament_index_cpp REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(ament_cmake_python REQUIRED)
 
@@ -30,7 +29,6 @@ ament_target_dependencies(eye_on_hand_calibrator
   tf2_eigen
   tf2_geometry_msgs
   tf2_ros
-  ament_index_cpp
   OpenCV
 )
 

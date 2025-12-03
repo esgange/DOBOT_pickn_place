@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <package format="3">
-  <name>aruco_perception</name>
+  <name>obstacle_perception</name>
   <version>0.0.1</version>
-  <description>RGB-D ArUco perception for computing marker 6D pose from a camera mounted on Link6.</description>
+  <description>Depth-based obstacle visualization anchored to the calibrated camera frame.</description>
   <maintainer email="maintainer@example.com">maintainer</maintainer>
   <license>BSD-3-Clause</license>
 
@@ -10,25 +10,23 @@
 
   <build_depend>rclcpp</build_depend>
   <build_depend>sensor_msgs</build_depend>
-  <build_depend>geometry_msgs</build_depend>
+  <build_depend>visualization_msgs</build_depend>
+  <build_depend>image_geometry</build_depend>
+  <build_depend>cv_bridge</build_depend>
+  <build_depend>opencv2</build_depend>
+  <build_depend>message_filters</build_depend>
   <build_depend>tf2</build_depend>
   <build_depend>tf2_ros</build_depend>
-  <build_depend>tf2_geometry_msgs</build_depend>
-  <build_depend>tf2_eigen</build_depend>
-  <build_depend>yaml-cpp</build_depend>
-  <build_depend>opencv2</build_depend>
-  <build_depend>cv_bridge</build_depend>
 
   <exec_depend>rclcpp</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
-  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>image_geometry</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>opencv2</exec_depend>
+  <exec_depend>message_filters</exec_depend>
   <exec_depend>tf2</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
-  <exec_depend>tf2_geometry_msgs</exec_depend>
-  <exec_depend>tf2_eigen</exec_depend>
-  <exec_depend>yaml-cpp</exec_depend>
-  <exec_depend>opencv2</exec_depend>
-  <exec_depend>cv_bridge</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
 

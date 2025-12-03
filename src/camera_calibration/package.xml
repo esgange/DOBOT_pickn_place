@@ -15,7 +15,6 @@
   <build_depend>tf2_eigen</build_depend>
   <build_depend>tf2_geometry_msgs</build_depend>
   <build_depend>tf2_ros</build_depend>
-  <build_depend>ament_index_cpp</build_depend>
   <build_depend>opencv2</build_depend>
   <build_depend>ament_cmake_python</build_depend>
 
@@ -26,7 +25,6 @@
   <exec_depend>tf2_eigen</exec_depend>
   <exec_depend>tf2_geometry_msgs</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
-  <exec_depend>ament_index_cpp</exec_depend>
   <exec_depend>opencv2</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>python_qt_binding</exec_depend>
