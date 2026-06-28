@@ -16,13 +16,13 @@ source install/setup.bash
 If this robot setup does not already have a platform reference, create it once:
 
 ```bash
-ros2 launch camera_calibration platform_teach.launch.py
+ros2 launch platform_calibration platform_calibration.launch.py
 ```
 
-Then teach or update the bin:
+Create or update a platform-relative bin teach YAML:
 
 ```bash
-ros2 launch item_perception_yolo bin_teach.launch.py
+ros2 launch item_perception_yolo bin_teach_yolo.launch.py
 ```
 
 ## 3. Teach A YOLO Item
@@ -43,6 +43,9 @@ Teach flow:
 
 For stable backgrounds, keep background images around 10-20% of the total
 training images. `Save BG` writes an empty YOLO label file for that ROI crop.
+Use `Save Session` to keep both the generated dataset and ROI review progress.
+Reloaded sessions resume saved ROI captures with annotated/skipped frame status
+intact, and annotated frames show their saved mask overlay.
 
 The final YOLO teach bundle is written to:
 
@@ -55,7 +58,6 @@ That folder contains the detector profile and final model files:
 ```text
 item_<item>[_bin_<bin>]_<ddmmyyyy>.yaml
 best.pt
-best.onnx
 ```
 
 ## 4. Run YOLO Detection
@@ -64,12 +66,38 @@ best.onnx
 ros2 launch item_perception_yolo item_detect_yolo.launch.py
 ```
 
+YOLO detect defaults to the same `/bin_camera` topics used by YOLO teach. Use
+`Open Model` to select a YOLO `.pt` model bundle; when the bundle has its sibling
+YAML, detect also loads the saved platform ROI, camera topics, and teach
+joints.
+
+YOLO inference starts OFF to save processing power. Click the top-right
+`YOLO: OFF` button to turn live detection ON. Seek and Repick force YOLO ON
+automatically if they are triggered while it is OFF.
+
 Default outputs:
 
 - `/bin_overlay`
 - `/bin_item_poses`
-- `/bin_seek_pose`
+- `/item_seek_pose`
 - `/bin_cube_marker`
 
-Use the top dropdown to select a YOLO profile. Use `Delete Item` to remove the
-selected YOLO profile and associated model bundle from disk.
+Use `Delete Item` to remove the selected YOLO profile and associated model
+bundle from disk.
+
+## 5. Debug A YOLO Model Against Samples
+
+```bash
+ros2 launch item_perception_yolo item_detect_yolo_debug.launch.py
+```
+
+Use `Open Model` for a custom `.onnx` or `.pt` model and `Open Image` or
+`Open Folder` for saved ROI/sample images. The debug view shows all classes by
+default. `.pt` models run on CPU unless you pass `pt_device:=0` or another
+Ultralytics device. You can also launch directly with paths:
+
+```bash
+ros2 launch item_perception_yolo item_detect_yolo_debug.launch.py \
+  model_path:=/abs/path/to/best.pt \
+  samples_path:=/abs/path/to/sample_folder
+```

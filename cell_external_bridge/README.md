@@ -186,7 +186,7 @@ For editable development:
 ```bash
 source /opt/ros/humble/setup.bash
 source <workspace-install>/setup.bash
-cd /home/erds/DOBOT_pickn_place
+cd "$HOME/DOBOT_pickn_place"
 pip install -e "cell_external_bridge[test]"
 set -a
 source station_config
@@ -197,10 +197,9 @@ cell-external-bridge
 
 ## Configuration
 
-The main station setup file is [station_config](/home/erds/DOBOT_pickn_place/station_config).
-It uses simple `KEY=value` lines so it can be sourced by a shell before running
-station processes. Environment variables still work as temporary one-command
-overrides.
+The main station setup file is `station_config` in the workspace root. It uses
+simple `KEY=value` lines so it can be sourced by a shell before running station
+processes. Environment variables still work as temporary one-command overrides.
 
 Normal `station_config` keys:
 
@@ -278,7 +277,7 @@ cell_external_bridge/
 ## Tests
 
 ```bash
-cd /home/erds/DOBOT_pickn_place
+cd "$HOME/DOBOT_pickn_place"
 pip install -e "cell_external_bridge[test]"
 PYTHONPATH=cell_external_bridge/src python -m pytest cell_external_bridge/tests/ -v
 ```

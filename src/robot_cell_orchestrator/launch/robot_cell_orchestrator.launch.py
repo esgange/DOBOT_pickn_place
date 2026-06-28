@@ -2,6 +2,8 @@ import os
 from pathlib import Path
 
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
@@ -49,13 +51,18 @@ def _ros_domain_action():
 def generate_launch_description():
     return LaunchDescription([
         _ros_domain_action(),
+        DeclareLaunchArgument('robot_status_topic', default_value='dobot_msgs_v4/msg/RobotStatus'),
         Node(
             package='robot_cell_orchestrator',
             executable='robot_cell_orchestrator_gui',
             name='robot_cell_orchestrator_gui',
             output='screen',
+            parameters=[{
+                'robot_status_topic': LaunchConfiguration('robot_status_topic'),
+            }],
             additional_env={
                 'PYTHONPATH': _robot_cell_orchestrator_pythonpath(),
+                'ROS_LOCALHOST_ONLY': '1',
             },
         ),
     ])

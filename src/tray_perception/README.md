@@ -2,15 +2,15 @@
 
 `tray_perception` provides the RGB-D teach and detect workflow for trays. A tray
 profile is taught with `tray_teach_node`, then `tray_detect_node` loads the
-profile to publish tray pose, tray velocity, and tray dimensions for downstream
-motion packages.
+profile to publish continuous tray pose, an averaged seek target pose, and tray
+dimensions for downstream motion packages.
 
 ## Nodes
 
 | Node | Executable | Purpose |
 | --- | --- | --- |
-| `tray_teach` | `tray_teach_node` | Interactive OpenCV UI for teaching tray ROI, edge settings, and optional depth-plane reference. |
-| `tray_detect` | `tray_detect_node` | Runtime detector for tray pose, seek confidence, tray vector, and dimensions service. |
+| `tray_teach` | `tray_teach_node` | Interactive OpenCV UI for teaching tray ROI, edge settings, and tray-plane reference. |
+| `tray_detect` | `tray_detect_node` | Runtime detector for tray pose, seek confidence, averaged target pose, and dimensions service. |
 
 ## Build
 
@@ -39,6 +39,9 @@ Both tray launch files expose `profiles_dir`. `tray_detect.launch.py` also
 exposes `selected_profile_path` and `runtime_settings_file`, so Robot Cell Orchestrator can
 launch offline tray detection from a selected teach file or online detection
 from the root `runtime/` handoff folder.
+When DOBOT bringup is running, `tray_teach_node` snapshots the current teach
+joints from `/dobot_bringup_ros2/srv/GetAngle` through the
+`motion_service_root` parameter and saves them as `teach_joints_deg`.
 
 Production/service mode can run without the OpenCV operator window:
 
@@ -58,19 +61,16 @@ ros2 launch tray_perception tray_detect.launch.py \
 ## Teach Workflow
 
 1. Enter a tray name.
-2. Select RGB or depth view.
+2. Select the view that makes the tray edge easiest to tune.
 3. Add the tray ROI.
 4. Tune thresholds, RGB exposure, and edge/ray settings.
-5. In depth mode, select the depth-plane ROI when prompted.
+5. Select the tray-plane ROI when prompted.
 6. Verify the overlay and save the tray profile.
 
-Detection mode is determined by the view used when placing the ROI:
-
-- ROI added in `RGB` view saves an RGB detection profile.
-- ROI added in `Depth` view saves a depth detection profile.
-
-Depth profiles save fixed depth-plane coefficients. Runtime detection loads the
-saved plane instead of recomputing it every frame.
+Saved profiles use RGB detection. Tray dimensions are measured from the RGB tray
+corners projected onto the saved tray plane, then saved as `tray_width_mm` and
+`tray_height_mm`. Runtime detection loads the saved plane instead of remeasuring
+tray depth every frame.
 
 RGB exposure uses the `RGB Exposure us` slider in `tray_teach`: `0` keeps camera
 auto exposure enabled and `1-100` sends that value directly as microseconds.
@@ -87,7 +87,7 @@ and `tray_detect` applies it when the selected profile is loaded.
 - keeps final seek debug PNG capture off by default; `Debug Img` is not saved to
   runtime settings as a production/headless safety exception, because persisting
   it can flood the repo with debug images on unattended runs;
-- supports RGB or depth detection based on the selected profile;
+- uses RGB edge detection and the saved tray plane for metric dimensions/pose;
 - publishes only after `seek_valid_frames_confidence` continuous valid frames;
 - resets seek evidence after `seek_decay_sec` without a valid frame;
 - publishes first/last seek artifacts for successful confidence runs;
@@ -108,11 +108,16 @@ Defaults:
 | --- | --- |
 | `use_calibration` | `true` |
 | `parent_frame` | `Link6` |
-| `child_frame` | `calibrated_camera_link` |
+| `child_frame` | `arm_calibrated_camera_link` |
 | `calibration_dir` | `WORKSPACE_ROOT/calibration` |
 
-If calibration is enabled and no usable YAML is available, launch shows an error
-dialog and exits.
+If calibration is enabled and no usable exact-IP YAML is available, launch shows
+an error dialog and exits. Auto-discovery only accepts calibration files tagged
+for the current robot IP.
+
+For robot IP `192.168.200.1`, `tray_detect.launch.py` does not auto-select an
+eye-on-hand file. It opens a filtered chooser, or requires
+`calibration_file:=<path>` when running headless.
 
 ## Inputs
 
@@ -129,9 +134,9 @@ dialog and exits.
 | `tray_overlay` | `sensor_msgs/msg/Image` | Runtime debug/preview image. |
 | `tray_pose` | `geometry_msgs/msg/PoseStamped` | Filtered canonical tray pose: lower-left origin, tray edge X/Y, natural right-handed Z. |
 | `tray_axis_overlay` | `geometry_msgs/msg/PolygonStamped` | The same 2D origin and X/Y unit directions drawn on the camera overlay. |
-| `tray_vector` | `dobot_msgs_v4/msg/TrayVector` | Pose, timing, velocity, speed, and direction. |
+| `tray_target_pose` | `geometry_msgs/msg/PoseStamped` | Latched seek result: confidence-qualified poses averaged after position/orientation outlier rejection. |
 | `tray_cube_marker` | `visualization_msgs/msg/Marker` | RViz cube marker. |
-| `tray_detect/get_tray_dimensions` | `dobot_msgs_v4/srv/GetTrayDimensions` | Live dimensions or taught-profile fallback. |
+| `tray_detect/get_tray_dimensions` | `dobot_msgs_v4/srv/GetTrayDimensions` | Taught tray dimensions from the active profile. |
 
 ## Profile Files
 
@@ -172,7 +177,7 @@ WORKSPACE_ROOT/debug files/seek_frames
 | `seek_window_sec` | `60.0` |
 | `seek_decay_sec` | `1.0` |
 | `seek_valid_frames_confidence` | `5` |
-| `area_tolerance_percent` | `15` |
+| `tray_dimension_tolerance_percent` | `15` |
 | `depth_threshold_mm` | `10` |
 | `depth_edge_offset_px` | `4` |
 | `camera_control_service_root` | `/robot_camera` |
@@ -187,7 +192,7 @@ WORKSPACE_ROOT/debug files/seek_frames
 ```bash
 ros2 topic hz /tray_overlay
 ros2 topic hz /tray_pose
-ros2 topic echo /tray_vector --once
+ros2 topic echo /tray_target_pose --once
 ros2 service call /tray_detect/get_tray_dimensions dobot_msgs_v4/srv/GetTrayDimensions {}
 ```
 

@@ -15,8 +15,10 @@
 #include <rclcpp/node.hpp>
 #include <rclcpp/executor.hpp>
 #include <nlohmann/json.hpp>
+#include <atomic>
 #include <string>
 #include <memory>
+#include <thread>
 #include <dobot_bringup/parseTool.h>
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <rclcpp_action/create_server.hpp>
@@ -118,6 +120,7 @@ class CRRobotRos2 : public rclcpp::Node
 {
 public:
     CRRobotRos2();
+    ~CRRobotRos2() override;
     void init();
     static void execute_action(const std::shared_ptr<dobot_msgs_v4::srv::EnableRobot::Request> request,
                                std::shared_ptr<dobot_msgs_v4::srv::EnableRobot::Response> response);
@@ -126,6 +129,7 @@ public:
     void getJointState(double *point);
     bool isEnable() const;
     bool isConnected() const;
+    uint16_t getRobotMode() const;
     void getToolVectorActual(double *val);
 
 protected:
@@ -226,6 +230,7 @@ protected:
 private:
     rclcpp::TimerBase::SharedPtr kTimer;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr kPublisherInfo;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr kPublisher200mSDIStatus;
     std::shared_ptr<rclcpp::Service<dobot_msgs_v4::srv::EnableRobot>> kServiceEnableRobot;
     std::shared_ptr<rclcpp::Service<dobot_msgs_v4::srv::DisableRobot>> kServiceDisableRobot;
     std::shared_ptr<rclcpp::Service<dobot_msgs_v4::srv::ClearError>> kServiceClearError;
@@ -320,11 +325,14 @@ private:
 private:
     void getErrorID(std::vector<int> &Vec);
     void pubFeedBackInfo();
+    void pub200mSDIStatus(const std::string robotIp);
 
 private:
     std::string kRobotName;
     std::shared_ptr<CRCommanderRos2> commander_;
+    std::atomic<bool> is_running_{false};
     std::thread threadPubFeedBackInfo;
+    std::thread threadPub200mSDIStatus;
 };
 
 #endif // CRROBOTROS2_H

@@ -1,5 +1,0 @@
-view_mode: rgb
-overlay_enabled: true
-blob_tolerance_percent: 50
-seek_window_sec: 60
-seek_decay_sec: 1

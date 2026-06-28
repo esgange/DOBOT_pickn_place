@@ -22,12 +22,12 @@ working directory, the running source/launch file, or colcon environment paths.
 | Area | Default path | Primary owners |
 | --- | --- | --- |
 | Camera calibration | `WORKSPACE_ROOT/calibration` | `camera_calibration` |
-| Platform calibration | `WORKSPACE_ROOT/calibration` | `camera_calibration/platform_teach` |
-| Bin teach files | `WORKSPACE_ROOT/teach/bin_teach` | `item_perception/bin_teach`, `item_perception_yolo/bin_teach` |
+| Platform calibration | `WORKSPACE_ROOT/calibration` | `platform_calibration` |
+| Bin teach files | `WORKSPACE_ROOT/teach/bin_teach` | `item_perception/bin_teach` |
 | Item teach profiles | `WORKSPACE_ROOT/teach/item_teach` | `item_perception/item_teach`, `item_pick` tool teach |
 | Item runtime state | `WORKSPACE_ROOT/config/item_perception` | `item_perception/item_detect`, `item_pick`, `robot_cell_orchestrator` |
 | YOLO item final bundles | `WORKSPACE_ROOT/teach/item_teach_yolo` | `item_perception_yolo/item_teach_yolo_node.py`, `item_detect_yolo_node.py` |
-| YOLO item scratch runtime | `WORKSPACE_ROOT/config/item_perception_yolo` | `item_perception_yolo/item_teach_yolo_node.py` |
+| YOLO item scratch/saved sessions | `WORKSPACE_ROOT/config/item_perception_yolo` | `item_perception_yolo/item_teach_yolo_node.py` |
 | Tray teach profiles | `WORKSPACE_ROOT/teach/tray_teach` | `tray_perception/tray_teach_node`, `tray_detect_node` |
 | Tray runtime/config state | `WORKSPACE_ROOT/config/tray_perception` | `tray_perception/tray_teach_node`, `tray_detect_node`, `tray_intercept`, `robot_cell_orchestrator` |
 | Online runtime handoff | `WORKSPACE_ROOT/runtime` | `robot_cell_orchestrator` |
@@ -53,20 +53,22 @@ Executable: `eye_on_hand_calibrator`
   `transform.rotation`.
 - Normalizes empty or wrong-mode `output_path` names back to the active
   mode-specific default.
-- Deletes older calibration YAMLs for the same active mode before writing.
+- Deletes older calibration YAMLs only when the active mode and robot-IP
+  filename suffix both match. Legacy no-IP and other-robot files are preserved.
 - Trigger: `save_calibration` service, usually reached from the GUI Save YAML flow.
 
-Executable: `platform_teach`
+Executable: `platform_calibration`
 
-- Writes platform teach/calibration YAML to
-  `WORKSPACE_ROOT/calibration/platform_calibration_<platform_name>.yaml`.
+- Writes platform calibration YAML to
+  `WORKSPACE_ROOT/calibration/platform_calibration_<platform_name>_<ddmmyyyy>_<robot_ip>.yaml`.
 - Platform calibration YAMLs use top-level `transform.translation` and
   `transform.rotation`, plus `metadata` for platform frame names and teach
   context.
 - If `platform_calibration_file` is provided, writes that exact file instead.
-- `platform_teach.launch.py` sets `delete_existing_on_save=true`, so old platform
-  calibration YAMLs in the output directory are removed before saving.
-- Trigger: Platform Teach GUI save action.
+- `platform_calibration.launch.py` sets `delete_existing_on_save=true`, so old
+  platform calibration YAMLs with the same robot-IP filename suffix are removed
+  before saving. Legacy no-IP and other-robot files are preserved.
+- Trigger: platform calibration GUI save action.
 
 Executable: `camera_calibration_gui`
 
@@ -98,6 +100,11 @@ Executable: `item_teach`
 - File root key: `item_detect`.
 - Profile content includes thresholds, ROI, depth plane, bin association, pose
   references, item name, teach date, and teach joints.
+- Saved item profiles also include footprint metadata from the visible pose
+  rectangle projected onto the loaded bin/depth plane:
+  `item_length_mm`, `item_width_mm`, `item_dimensions_mm`, and compatibility
+  `taught_item_average_*` fields. The dimension source is recorded as
+  `rgb_pose_rectangle_on_bin_plane` when the plane came from `bin_teach`.
 - Can delete a selected bin teach file from `bin_teach_dir`.
 - Triggers: runtime tuning changes, `Save Item`, and Bin Teach delete button.
 
@@ -111,16 +118,16 @@ Executable: `item_detect`
   `seek_<stamp>_last.png` and `seek_<stamp>_pose.yaml`.
 - Deletes the selected dated item profile YAML when the UI delete flow is
   confirmed.
+- Runtime item pose still uses live measured depth, with the saved depth plane
+  used for residual/window filtering and optional Z-axis alignment. The saved
+  item length/width fields are profile metadata in the current detect path.
 
 ### `item_perception_yolo`
 
-Installed C++ executable: `bin_teach`
-
-- The C++ `bin_teach` node writes bin teach YAMLs with the same file behavior as
-  `item_perception/bin_teach`.
-- The current package no longer installs a classic C++ `item_teach` or
-  `item_detect` executable. Use `item_perception` for the classic item workflow,
-  and use the Python YOLO teach/detect nodes below for the YOLO/SAM2 workflow.
+The YOLO package consumes bin teach YAMLs from `WORKSPACE_ROOT/teach/bin_teach`
+but does not install its own `bin_teach` executable or launch file. Use
+`item_perception/bin_teach` to teach or update bin ROI/depth-plane profiles, and
+use the Python YOLO teach/detect nodes below for the YOLO/SAM2 workflow.
 - `item_perception_yolo/launch/item_detect_yolo.launch.py` launches the Python
   YOLO detect node.
 
@@ -138,13 +145,26 @@ Executable: `item_teach_yolo_node.py`
   Ultralytics.
 - Promotion creates a final detector-ready teach bundle under
   `WORKSPACE_ROOT/teach/item_teach_yolo/item_<item>[_bin_<bin>]_<ddmmyyyy>`.
-- The final bundle contains `best.pt`, `best.onnx`, and
+- The final bundle contains `best.pt` and
   `item_<item>[_bin_<bin>]_<ddmmyyyy>.yaml`.
-- Cleans the old runtime session directory when the item name is changed.
+- Saved teach sessions are stored under
+  `WORKSPACE_ROOT/config/item_perception_yolo/item_teach_yolo_saved_sessions`.
+  The UI can save the active session, load a session by item name, and delete
+  saved sessions from the Load Session dropdown.
+- Unsaved runtime sessions are removed when the item name changes or when the
+  node exits. Saved sessions are kept until explicitly deleted.
 
 Executable: `item_detect_yolo_node.py`
 
-- Does not create steady-state runtime files in the current code path.
+- Writes runtime UI state to
+  `WORKSPACE_ROOT/config/item_perception_yolo/item_detect_yolo_runtime_settings.yaml`
+  and exports the selected model path to
+  `WORKSPACE_ROOT/config/item_perception_yolo/item_detect_yolo_selected_model.txt`.
+- Defaults to the same `/bin_camera` topics as YOLO teach and, by default, uses
+  the camera topics stored in the selected trained profile.
+- Uses the classic non-YOLO item-detect top-bar UI but opens YOLO `.pt` model
+  bundles with `Open Model`; sibling YAML metadata supplies ROI, bin plane,
+  camera topics, item name, and teach joints when available.
 - Deletes selected YOLO teach bundles from
   `WORKSPACE_ROOT/teach/item_teach_yolo` when the selected profile points at a
   safe path inside that teach root.
@@ -160,8 +180,9 @@ Executable: `tray_teach_node`
 - Also overwrites the latest settings alias:
   `WORKSPACE_ROOT/config/tray_perception/tray_teach_settings.yaml`.
 - File root key: `tray_detect`.
-- Profile content includes thresholds, ROI, depth plane, tray name, teach date,
-  teach joints, edge lengths, and area.
+- Profile content includes thresholds, ROI, tray plane coefficients/ROI points,
+  tray name, teach date, teach joints, and `tray_width_mm`/`tray_height_mm`
+  measured from RGB tray corners projected onto the tray plane.
 - Trigger: `Save Tray` in the tray teach UI.
 
 Executable: `tray_detect_node`
@@ -200,10 +221,23 @@ Executable: `camera_launcher_gui`
   `WORKSPACE_ROOT/config/camera_bringup/orbbec_cameras.yaml`.
 - Preserves and uses the `orbbec_launch_args` block in the same YAML as the
   editable `orbbec_camera gemini_330_series.launch.py` launch argument set.
+- Creates transient terminal PID marker files under
+  `WORKSPACE_ROOT/runtime/orbbec_camera_launcher_pids` while capturing visible
+  launch process groups; those PID files are removed immediately after capture.
 - Trigger: `Save Mapping` and `Launch Cameras`; launch saves the mapping before
   starting the two Orbbec launch processes.
 - Starts `orbbec_camera gemini_330_series.launch.py` subprocesses by
   `serial_number` and `camera_name`, but does not write camera image/depth data.
+- Stop/Close sends shutdown signals to tracked launch process groups and sweeps
+  still-running configured Orbbec process groups by saved camera name, preventing
+  hidden camera drivers from continuing to stream after the launcher is closed.
+
+Executable: `camera_watchdog`
+
+- Owns supervised Orbbec launch subprocesses in separate process groups.
+- Publishes health/status topics and restarts stale or exited camera drivers
+  with bounded backoff.
+- Does not write project files; shutdown stops owned driver process groups.
 
 ### `motion_debug`
 
@@ -241,6 +275,9 @@ Executable: `tray_intercept`
 
 - Writes runtime GUI state to
   `WORKSPACE_ROOT/config/tray_perception/tray_intercept_runtime_settings.json`.
+- The runtime settings do not include an EE alignment toggle. The node always
+  aligns the final TCP/Link6 yaw to the tray Y axis as a parallel line and then
+  applies the operator angle offset.
 - Reads movement calibration JSON from
   `WORKSPACE_ROOT/calibration/relmovl_speed_calibration.json` or newest
   `WORKSPACE_ROOT/calibration/relmovl_speed_calibration*.json`.
@@ -296,8 +333,8 @@ Executable: `robot_cell_orchestrator_gui`
 | --- | --- | --- |
 | Eye-on-hand camera calibration | `calibration/axab_calibration_eyeonhand_<ddmmyyyy>.yaml` | `camera_calibration/eye_on_hand_calibrator` |
 | Eye-to-hand camera calibration | `calibration/axab_calibration_eyetohand_<ddmmyyyy>.yaml` | `camera_calibration/eye_on_hand_calibrator` |
-| Platform calibration | `calibration/platform_calibration_<name>.yaml` | `camera_calibration/platform_teach` |
-| Bin teach | `teach/bin_teach/bin_<bin>_<ddmmyyyy>.yaml` | `item_perception/bin_teach`, `item_perception_yolo/bin_teach` |
+| Platform calibration | `calibration/platform_calibration_<name>_<ddmmyyyy>_<robot_ip>.yaml` | `platform_calibration` |
+| Bin teach | `teach/bin_teach/bin_<bin>_<ddmmyyyy>.yaml` | `item_perception/bin_teach` |
 | Item teach/profile | `teach/item_teach/item_<item>[_bin_<bin>]_<ddmmyyyy>.yaml` | `item_perception/item_teach` |
 | Item YOLO teach bundle | `teach/item_teach_yolo/item_<item>[_bin_<bin>]_<ddmmyyyy>/...` | `item_perception_yolo/item_teach_yolo_node.py` |
 | Tray teach/profile | `teach/tray_teach/tray_<tray>_<ddmmyyyy>.yaml` | `tray_perception/tray_teach_node` |
@@ -326,14 +363,15 @@ moved, because some entries point to trained model bundles and dataset snapshots
 - `teach/tray_teach` now holds dated tray profiles. `config/tray_perception` holds runtime
   state and the active/latest tray settings alias.
 - Platform calibration moved out of `teach/` and now lives with other
-  calibration outputs under `calibration/platform_calibration_<platform>.yaml`.
+  calibration outputs under
+  `calibration/platform_calibration_<platform>_<ddmmyyyy>_<robot_ip>.yaml`.
 - `debug files/seek_frames` is shared by item seek and tray seek. Separate
   `debug files/item_seek_frames` and `debug files/tray_seek_frames` would make
   cleanup safer.
 - `debug files/robot_cell_orchestrator_movement_deltas` is debug-only and stores one text
   file per robot cycle, updated as movement tracker events arrive.
-- `item_perception_yolo` shares the classic bin-teach path through its C++
-  `bin_teach` executable, but its final YOLO item bundles live under
+- `item_perception_yolo` reads classic bin-teach YAMLs from `teach/bin_teach`,
+  but its final YOLO item bundles live under
   `teach/item_teach_yolo` and do not write classic item profiles under
   `teach/item_teach`.
 - `item_pick` now stores tool teach data inside each dated item profile. Legacy
@@ -343,7 +381,6 @@ moved, because some entries point to trained model bundles and dataset snapshots
 - `third_party/debs` and `third_party/wheels` are the offline dependency depot.
   The directories are part of the repo layout, while large binary payloads are
   intended for release archives or local transfer bundles.
-- Calibration teach nodes intentionally enforce a single active file per relevant
-  calibration mode by deleting older matching calibration YAMLs in the same
-  directory. Eye-on-hand and eye-to-hand files can coexist, but backups still
-  matter before saving a new calibration.
+- Calibration save nodes delete older matching YAMLs only for the same robot-IP
+  filename suffix. Camera calibration also requires the same eye-on-hand or
+  eye-to-hand mode. Legacy no-IP files and files for other robots are preserved.

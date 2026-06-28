@@ -69,16 +69,23 @@ def _ros_domain_action():
 def generate_launch_description():
     params_file = LaunchConfiguration("params_file")
     color_topic = LaunchConfiguration("color_topic")
-    joint_states_topic = LaunchConfiguration("joint_states_topic")
+    motion_service_root = LaunchConfiguration("motion_service_root")
     item_name = LaunchConfiguration("item_name")
     bin_teach_dir = LaunchConfiguration("bin_teach_dir")
     runtime_root = LaunchConfiguration("runtime_root")
+    saved_sessions_root = LaunchConfiguration("saved_sessions_root")
     runtime_settings_path = LaunchConfiguration("runtime_settings_path")
     profile_dir = LaunchConfiguration("profile_dir")
     model_root = LaunchConfiguration("model_root")
     depth_topic = LaunchConfiguration("depth_topic")
     camera_info_topic = LaunchConfiguration("camera_info_topic")
+    projection_camera_frame = LaunchConfiguration("projection_camera_frame")
     overlay_topic = LaunchConfiguration("overlay_topic")
+    calibration_dir = LaunchConfiguration("calibration_dir")
+    calibration_file = LaunchConfiguration("calibration_file")
+    platform_calibration_file = LaunchConfiguration("platform_calibration_file")
+    robot_ip_address = LaunchConfiguration("robot_ip_address")
+    publish_static_calibration_tfs = LaunchConfiguration("publish_static_calibration_tfs")
     camera_control_service_root = LaunchConfiguration("camera_control_service_root")
     color_exposure_min_us = LaunchConfiguration("color_exposure_min_us")
     color_exposure_max_us = LaunchConfiguration("color_exposure_max_us")
@@ -90,6 +97,8 @@ def generate_launch_description():
     train_epochs = LaunchConfiguration("train_epochs")
     train_imgsz = LaunchConfiguration("train_imgsz")
     train_device = LaunchConfiguration("train_device")
+    train_use_gpu_if_available = LaunchConfiguration("train_use_gpu_if_available")
+    record_fps = LaunchConfiguration("record_fps")
     display_scale = LaunchConfiguration("display_scale")
     live_view_enabled = LaunchConfiguration("live_view_enabled")
     overlay_enabled = LaunchConfiguration("overlay_enabled")
@@ -103,12 +112,16 @@ def generate_launch_description():
             default_value=_repo_path("src", "item_perception_yolo", "config", "item_teach_yolo.yaml"),
         ),
         DeclareLaunchArgument("color_topic", default_value=BIN_CAMERA_COLOR_TOPIC),
-        DeclareLaunchArgument("joint_states_topic", default_value="/joint_states_robot"),
+        DeclareLaunchArgument("motion_service_root", default_value="/dobot_bringup_ros2/srv"),
         DeclareLaunchArgument("item_name", default_value=""),
         DeclareLaunchArgument("bin_teach_dir", default_value=_repo_path("teach", "bin_teach")),
         DeclareLaunchArgument(
             "runtime_root",
             default_value=_repo_path("config", "item_perception_yolo", "item_teach_yolo_runtime"),
+        ),
+        DeclareLaunchArgument(
+            "saved_sessions_root",
+            default_value=_repo_path("config", "item_perception_yolo", "item_teach_yolo_saved_sessions"),
         ),
         DeclareLaunchArgument(
             "runtime_settings_path",
@@ -118,7 +131,17 @@ def generate_launch_description():
         DeclareLaunchArgument("model_root", default_value=_repo_path("teach", "item_teach_yolo")),
         DeclareLaunchArgument("depth_topic", default_value=BIN_CAMERA_DEPTH_TOPIC),
         DeclareLaunchArgument("camera_info_topic", default_value=BIN_CAMERA_INFO_TOPIC),
+        DeclareLaunchArgument("projection_camera_frame", default_value="bin_calibrated_camera_link"),
         DeclareLaunchArgument("overlay_topic", default_value="bin_overlay"),
+        DeclareLaunchArgument("calibration_dir", default_value=_repo_path("calibration")),
+        DeclareLaunchArgument("calibration_file", default_value=""),
+        DeclareLaunchArgument("platform_calibration_file", default_value=""),
+        DeclareLaunchArgument(
+            "robot_ip_address",
+            default_value="",
+            description="Robot controller IP for calibration file discovery. Empty uses ROBOT_IP_ADDRESS/station_config.",
+        ),
+        DeclareLaunchArgument("publish_static_calibration_tfs", default_value="true"),
         DeclareLaunchArgument("camera_control_service_root", default_value=BIN_CAMERA_CONTROL_SERVICE_ROOT),
         DeclareLaunchArgument("color_exposure_min_us", default_value="1"),
         DeclareLaunchArgument("color_exposure_max_us", default_value="100"),
@@ -135,11 +158,13 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument("train_epochs", default_value="80"),
         DeclareLaunchArgument("train_imgsz", default_value="640"),
-        DeclareLaunchArgument("train_device", default_value="cpu"),
+        DeclareLaunchArgument("train_device", default_value="0"),
+        DeclareLaunchArgument("train_use_gpu_if_available", default_value="true"),
+        DeclareLaunchArgument("record_fps", default_value="5.0"),
         DeclareLaunchArgument("display_scale", default_value="1.0"),
         DeclareLaunchArgument("live_view_enabled", default_value="true"),
         DeclareLaunchArgument("overlay_enabled", default_value="true"),
-        DeclareLaunchArgument("clear_runtime_on_start", default_value="true"),
+        DeclareLaunchArgument("clear_runtime_on_start", default_value="false"),
         DeclareLaunchArgument(
             "python_executable",
             default_value=_repo_path(".venv", "bin", "python"),
@@ -154,16 +179,24 @@ def generate_launch_description():
                 params_file,
                 {
                     "color_topic": color_topic,
-                    "joint_states_topic": joint_states_topic,
+                    "motion_service_root": motion_service_root,
                     "item_name": item_name,
                     "bin_teach_dir": bin_teach_dir,
                     "runtime_root": runtime_root,
+                    "saved_sessions_root": saved_sessions_root,
                     "runtime_settings_path": runtime_settings_path,
                     "profile_dir": profile_dir,
                     "model_root": model_root,
                     "depth_topic": depth_topic,
                     "camera_info_topic": camera_info_topic,
+                    "projection_camera_frame": projection_camera_frame,
                     "overlay_topic": overlay_topic,
+                    "calibration_dir": calibration_dir,
+                    "calibration_file": calibration_file,
+                    "platform_calibration_file": platform_calibration_file,
+                    "robot_ip_address": robot_ip_address,
+                    "publish_static_calibration_tfs": ParameterValue(
+                        publish_static_calibration_tfs, value_type=bool),
                     "camera_control_service_root": camera_control_service_root,
                     "color_exposure_min_us": ParameterValue(color_exposure_min_us, value_type=int),
                     "color_exposure_max_us": ParameterValue(color_exposure_max_us, value_type=int),
@@ -174,7 +207,10 @@ def generate_launch_description():
                     "yolo_base_model": yolo_base_model,
                     "train_epochs": ParameterValue(train_epochs, value_type=int),
                     "train_imgsz": ParameterValue(train_imgsz, value_type=int),
-                    "train_device": train_device,
+                    "train_device": ParameterValue(train_device, value_type=str),
+                    "train_use_gpu_if_available": ParameterValue(
+                        train_use_gpu_if_available, value_type=bool),
+                    "record_fps": ParameterValue(record_fps, value_type=float),
                     "display_scale": ParameterValue(display_scale, value_type=float),
                     "live_view_enabled": ParameterValue(live_view_enabled, value_type=bool),
                     "overlay_enabled": ParameterValue(overlay_enabled, value_type=bool),

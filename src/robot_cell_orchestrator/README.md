@@ -8,21 +8,22 @@ Cycle sequence:
 Readiness gate:
 
 - Create the service clients once when the node starts.
-- Scan calibration files, teach/runtime files, and service availability while
-  the GUI is open.
-- Re-check all required services at the start of every cycle; stop the cycle if
-  any required service is unavailable.
+- Scan calibration files, teach/runtime files, service availability, and the
+  robot status publisher while the GUI is open.
+- Re-check all required services and topics at the start of every cycle; stop
+  the cycle if any required interface is unavailable.
 
 1. `/item_detect/go_to_teach`
 2. `/item_pick/track`
 3. Verify `/item_pick/track_status` reports armed
-4. Monitor robot TCP feedback until it is stable
+4. Wait for `RobotStatus` to report controller idle
 5. `/item_detect/seek`
-6. Wait for `/item_detect/seek_status` to turn on, then off
+6. Wait for `/item_detect/seek_status` to turn on, remain on through any
+   `item_detect/repick` attempts, then turn off only after successful final Z-up
 7. `/tray_detect/go_to_teach`
 8. `/tray_intercept/start_sequence` with the orchestrator tray X/Y/RZ settings
 9. Verify `/tray_intercept/track_status` reports armed
-10. Monitor robot TCP feedback until it is stable
+10. Wait for `RobotStatus` to report controller idle
 11. `/tray_detect/seek`
 12. Wait for `/tray_detect/seek_status` to turn on, then off
 
@@ -33,17 +34,21 @@ data returned by seek services and no longer uses pose topics, fixed seek
 timeouts, fixed robot-stop waits, or a required motion-detected gate. It waits
 for each detect node's Seek status to turn on after the seek command, then turn
 off again, so an old OFF state cannot be mistaken for completion. The detect
-node's own configurable seek window controls the maximum seek time. It only watches
-`/dobot_msgs_v4/msg/ToolVectorActual`, the same TCP feedback topic used by
-`item_pick` and `tray_intercept`. After each arm/start call, the GUI verifies
-the corresponding armed-status service before waiting for TCP stability and
-sending seek.
+node's configurable seek window controls each acquisition window; if no valid
+item is found, Item Detect starts another window while keeping Seek ON. The
+orchestrator listens to `dobot_msgs_v4/msg/RobotStatus` and waits for controller
+idle after each arm/start call and armed-status acknowledgement before sending
+seek.
 
-The robot is treated as stable when TCP feedback stays within 1 mm linear and
-1 degree rotational for the selected stability time. The stability timer is
-based on live feedback time, not a fixed number of frames. A 30 second internal
-watchdog prevents robot monitoring from hanging forever and logs the last
-observed TCP delta when it cannot classify stability.
+Item Pick owns failed-suction repicks. The orchestrator does not restart the
+pick side between attempts; its existing Seek ON-to-OFF wait acts as the
+success gate and prevents placement after a failed pickup.
+
+The robot is treated as arrived when `RobotStatus.robot_mode` reports enabled
+idle (`5`) for the selected stability time. A fresh status sample after the
+arm/start acknowledgement is required, so an old idle state cannot complete the
+wait. A 30 second internal watchdog prevents robot monitoring from hanging
+forever and logs the last observed mode when it cannot classify arrival.
 
 ## Launch
 
@@ -61,7 +66,7 @@ Launch the Robot Cell Orchestrator GUI:
 ros2 launch robot_cell_orchestrator robot_cell_orchestrator.launch.py
 ```
 
-Launch the runtime stack without Robot Cell Orchestrator GUI:
+Launch the Robot Cell Orchestrator managed headless runtime stack:
 
 ```bash
 ros2 launch robot_cell_orchestrator robot_runtime_headless.launch.py
@@ -69,7 +74,13 @@ ros2 launch robot_cell_orchestrator robot_runtime_headless.launch.py
 
 This starts the configured Orbbec cameras, `item_detect`, `item_pick` in
 headless service mode, `tray_detect`, and `tray_intercept` in headless service
-mode. RViz is available as a launch argument and is off by default:
+mode under the Robot Cell Orchestrator launch. The calibration files come from
+the Robot Cell Orchestrator UI runtime settings saved in
+`config/robot_cell_orchestrator/robot_cell_orchestrator_runtime_settings.yaml`.
+The camera watchdog publishes `/camera_watchdog/status` and
+`/camera_watchdog/healthy`, and automatically relaunches camera drivers whose
+color/depth streams stop. RViz is available as a launch argument and is off by
+default:
 
 ```bash
 ros2 launch robot_cell_orchestrator robot_runtime_headless.launch.py launch_rviz:=true
@@ -89,15 +100,23 @@ WORKSPACE_ROOT/config/robot_cell_orchestrator/robot_runtime_headless_settings.ya
 ```
 
 That file owns camera launch selection, RViz on/off, online/offline profile
-dirs, topics, service names, calibration paths, and child runtime settings file
-paths. Launch arguments are overrides only, for example:
+dirs, topics, service names, and child runtime settings file paths. Calibration
+file choices are owned by the Robot Cell Orchestrator UI settings file:
+
+```text
+WORKSPACE_ROOT/config/robot_cell_orchestrator/robot_cell_orchestrator_runtime_settings.yaml
+```
+
+The headless launch passes those UI-selected Eye-on-hand and Eye-to-hand files
+to the child nodes. Its `camera.watchdog` section controls startup/health
+timeouts and restart backoff. Launch arguments are overrides only, for example:
 
 ```bash
 ros2 launch robot_cell_orchestrator robot_runtime_headless.launch.py launch_rviz:=true mode:=offline
 ```
 
 The motion settings for headless `item_pick` and `tray_intercept` are loaded
-from their JSON runtime files in `config/item_perception` and
+from their JSON runtime files in `config/item_pick` and
 `config/tray_perception`. In headless mode those JSON files must exist and
 contain all required keys; the nodes will not silently continue with launch
 defaults when runtime settings are incomplete.
@@ -109,7 +128,9 @@ ros2 run robot_cell_orchestrator robot_cell_orchestrator_gui
 ```
 
 `robot_cell_orchestrator_gui` arms `item_pick` and `tray_intercept`, then coordinates the
-shared `item_detect` and `tray_detect` seek services.
+shared `item_detect` and `tray_detect` seek services. Its robot-arrival monitor
+listens to `dobot_msgs_v4/msg/RobotStatus`; override `robot_status_topic` if
+the status stream is remapped.
 
 Robot Cell Orchestrator GUI runtime knobs and window size are saved in:
 
@@ -117,9 +138,21 @@ Robot Cell Orchestrator GUI runtime knobs and window size are saved in:
 WORKSPACE_ROOT/config/robot_cell_orchestrator/robot_cell_orchestrator_runtime_settings.yaml
 ```
 
-This file stores Step Mode, tray seek stability, tray placement X/Y/RZ offsets,
-and the Robot Cell Orchestrator window geometry. The loop and Auto Repick
-checkboxes are session-only; Auto Repick is currently UI-only.
+This file stores Step Mode, Auto Repick, tray seek stability, tray placement
+X/Y/RZ offsets, and the Robot Cell Orchestrator window geometry. The Auto Repick
+checkbox calls `item_pick/set_auto_repick` and is applied again at the start of
+each pick side.
+
+The right-side **Robot Connection** panel shows `ROBOT_IP_ADDRESS` from the root
+`station_config`. Edit the IP and press **Save** to update that file. Robot
+Bringup reads `station_config` when it launches, so stop and relaunch Robot
+Bringup after changing the IP. For direct LAN2 debug, the controller IP is
+normally `192.168.200.1`; set the PC wired adapter to the same `/24` subnet.
+
+The right-side **Camera Views** section opens the bin/tray detect overlays in a
+separate **Camera Detect Views** window. Press **Open Camera Window** to create
+the viewer; pressing it again brings the existing viewer to the front. Close the
+camera viewer from that window when it is no longer needed.
 
 Switching the Robot Cell Orchestrator GUI between **Offline** and **Online**
 only changes the orchestration mode. It does not launch or stop robot,
@@ -132,6 +165,12 @@ right-side **Node Launcher** when you want them running:
 - `Item Detect`
 - `Tray Intercept`
 - `Tray Detect`
+
+The Node Launcher starts each support process in a sourced shell rooted at
+`WORKSPACE_ROOT` and exports `DOBOT_PICKN_PLACE_ROOT` for child launches. This
+keeps Robot Bringup, camera launcher, and perception nodes using the same
+station-local config paths whether they are started from the UI or from a direct
+terminal.
 
 When the Node Launcher headless toggle is ON, `Item Pick` and `Tray Intercept`
 use `headless:=true` and load their JSON runtime settings. `Item Detect` and
@@ -147,14 +186,15 @@ nodes are launched manually.
 
 ```text
 WORKSPACE_ROOT/teach/bin_teach
-WORKSPACE_ROOT/teach/item_teach
-WORKSPACE_ROOT/teach/tray_teach
+WORKSPACE_ROOT/teach/item_teach_yolo
+WORKSPACE_ROOT/teach/tray_teach_yolo
 ```
 
-The offline dropdowns choose the bin, item, and tray teach files used for the
-manual cycle gate. When Robot Cell Orchestrator launches offline item/tray detect nodes, it
-passes the selected item/tray teach file as `selected_profile_path:=...`. It does
-not copy teach files or remember the selected teach in detect runtime settings.
+The offline dropdowns choose the bin, item, and tray teach files used for
+the manual cycle gate. When Robot Cell Orchestrator launches offline item/tray
+detect nodes, it passes the selected item/tray teach file as
+`selected_profile_path:=...`. It does not copy teach files or remember the
+selected teach in detect runtime settings.
 
 The right panel also has an **External Bridge** control above **Node Launcher**.
 When Robot Cell Orchestrator is in Offline mode, that button starts `cell_external_bridge` in
@@ -186,13 +226,24 @@ YAML with root key `tool_teach_version` is still accepted for older profiles.
 
 Unknown YAML files block online readiness. Non-YAML files are ignored.
 
-Cycle start is blocked until all three calibration classes are present:
+Cycle start is blocked until the operator selects one file for each calibration
+class in the `Calibration Files` panel:
 
 ```text
-WORKSPACE_ROOT/calibration/axab_calibration_eyeonhand_*.yaml
-WORKSPACE_ROOT/calibration/axab_calibration_eyetohand_*.yaml
-WORKSPACE_ROOT/calibration/platform_calibration_*.yaml
+Eye-on-hand
+Eye-to-hand
+Platform
 ```
+
+The selections are persisted in
+`config/robot_cell_orchestrator/robot_cell_orchestrator_runtime_settings.yaml`.
+The orchestrator passes the selected paths explicitly to calibration consumers;
+it does not choose the newest or legacy calibration automatically.
+Each calibration picker filters the file dialog to the matching filename class:
+`axab_calibration_eyeonhand_*.yaml` for Eye-on-hand,
+`axab_calibration_eyetohand_*.yaml` for Eye-to-hand, and
+`platform_calibration_*.yaml` for Platform. After selection, the YAML metadata is
+still checked so a wrongly named file is rejected.
 
 The external online start API is:
 

@@ -10,7 +10,7 @@ from launch_ros.actions import Node
 STRING_PARAMS = (
     'runtime_settings_file',
     'motion_service_root',
-    'tray_vector_topic',
+    'tray_target_pose_topic',
     'tray_axis_overlay_topic',
     'start_sequence_service',
     'track_service',
@@ -39,9 +39,13 @@ FLOAT_PARAMS = (
     'post_follow_z_up_mm',
     'command_hysteresis_sec',
     'goal_tf_lookup_timeout_sec',
-    'tray_prediction_max_lead_sec',
     'preview_tray_length_mm',
     'preview_tray_width_mm',
+)
+
+INT_PARAMS = (
+    'tcp_pose_user',
+    'tcp_pose_tool',
 )
 
 
@@ -107,6 +111,13 @@ def _float_arg(value: str, name: str) -> float:
         raise RuntimeError(f'{name} must be a number, got {value!r}') from exc
 
 
+def _int_arg(value: str, name: str) -> int:
+    try:
+        return int(float(value))
+    except ValueError as exc:
+        raise RuntimeError(f'{name} must be an integer, got {value!r}') from exc
+
+
 def _launch_setup(context, *args, **kwargs):
     del args, kwargs
     params = {}
@@ -122,6 +133,10 @@ def _launch_setup(context, *args, **kwargs):
         value = _arg(context, name)
         if value:
             params[name] = _float_arg(value, name)
+    for name in INT_PARAMS:
+        value = _arg(context, name)
+        if value:
+            params[name] = _int_arg(value, name)
 
     return [
         Node(
@@ -143,5 +158,6 @@ def generate_launch_description():
         *[DeclareLaunchArgument(name, default_value='') for name in STRING_PARAMS],
         *[DeclareLaunchArgument(name, default_value='') for name in BOOL_PARAMS],
         *[DeclareLaunchArgument(name, default_value='') for name in FLOAT_PARAMS],
+        *[DeclareLaunchArgument(name, default_value='') for name in INT_PARAMS],
         OpaqueFunction(function=_launch_setup),
     ])

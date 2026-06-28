@@ -26,15 +26,23 @@ source install/setup.bash
 ros2 launch item_pick item_pick.launch.py
 ```
 
-Headless service mode, with no Tkinter window:
+Headless service mode is launched by Robot Cell Orchestrator so it can pass the
+selected item profile, runtime settings, and calibration files from the
+orchestrator UI settings:
 
 ```bash
-ros2 launch item_pick item_pick.launch.py headless:=true
+ros2 launch robot_cell_orchestrator robot_runtime_headless.launch.py
 ```
 
 Important launch arguments are `runtime_settings_file`,
-`item_profile_state_file`, `motion_service_root`, `item_pose_topic`,
-`track_service`, `track_status_service`, and `item_seek_complete_service`.
+`item_profile_state_file`, `selected_profile_topic`, `motion_service_root`, `gripper_do_service`,
+`di_status_topic`, `robot_status_topic`, `item_pose_topic`, `track_service`,
+`track_status_service`, `item_seek_complete_service`,
+`item_repick_service`, `auto_repick_service`, `repick_start_stability_sec`, and
+`pick_motion_speed_percent`. Camera-bin safety uses
+`camera_safety_frame_id` and the required `camera_safety_calibration_file`.
+Failed-pick retry is controlled by `auto_repick_on_failed_suction` and defaults
+to `true`.
 When `load_runtime_settings:=true`, the JSON runtime settings are loaded at
 startup. In headless mode the JSON file must exist and include the complete
 runtime key set; launch arguments are treated as overrides, not the normal place
@@ -50,20 +58,24 @@ ros2 run item_pick item_pick
 
 | Input | Type | Source |
 | --- | --- | --- |
-| `bin_seek_pose` | `geometry_msgs/msg/PoseStamped` | `item_detect` selected item pose. |
-| `dobot_msgs_v4/msg/ToolVectorActual` | `dobot_msgs_v4/msg/ToolVectorActual` | DOBOT bringup TCP feedback. |
-| `item_detect_selected_profile.txt` | text file | Active profile exported by `item_detect`. |
+| `item_seek_pose` | `geometry_msgs/msg/PoseStamped` | `item_detect` selected item pose. |
+| `item_detect/selected_profile` | `std_msgs/msg/String` | Latched path of the item teach currently loaded by `item_detect`. |
+| `/dobot_bringup_ros2/DIStatus_200mS` | `std_msgs/msg/String` | Slow DI status stream used for DI1 suction confirmation after retract. |
+| `dobot_msgs_v4/msg/RobotStatus` | `dobot_msgs_v4/msg/RobotStatus` | Live controller mode used to verify the robot is idle before `GetPose`. |
+| `camera_safety_calibration_file` | YAML path | Required eye-on-hand calibration loaded once for camera-bin safety. |
+| `item_detect_yolo_selected_profile.txt` | text file | Active YOLO profile exported by `item_detect`. |
 
-The active profile export is read from:
+The selected-profile topic is the primary live handoff. The active profile
+export remains a startup and backward-compatible fallback and is read from:
 
 ```text
-WORKSPACE_ROOT/config/item_perception/item_detect_selected_profile.txt
+WORKSPACE_ROOT/config/item_perception_yolo/item_detect_yolo_selected_profile.txt
 ```
 
 GUI runtime settings are saved to:
 
 ```text
-WORKSPACE_ROOT/config/item_perception/item_pick_runtime_settings.json
+WORKSPACE_ROOT/config/item_pick/item_pick_runtime_settings.json
 ```
 
 ## Services
@@ -75,6 +87,7 @@ WORKSPACE_ROOT/config/item_perception/item_pick_runtime_settings.json
 | `item_pick/track` | `std_srvs/srv/Trigger` | Arms the same pick sequence as the GUI track button. |
 | `item_pick/track_status` | `std_srvs/srv/Trigger` | Returns success while track is armed and waiting for a fresh item pose. |
 | `item_pick/start_sequence` | `dobot_msgs_v4/srv/TrayInterceptStart` | Arms and starts the pick sequence with explicit settings. |
+| `item_pick/set_auto_repick` | `std_srvs/srv/SetBool` | Enables/disables Auto Repick after a failed pickup. |
 
 The `start_sequence` service type is shared with `tray_intercept`, so field
 names contain `tray_*`; in this package those values are interpreted as
@@ -95,29 +108,50 @@ Robot service clients use the DOBOT bringup service root:
 
 Main robot services used:
 
-- `Stop`
+- `GetPose` (one-shot current TCP read before pick-orientation selection)
+- `GetAngle`
+- `MovJ`
 - `MovL`
 - `MovLIO`
 - `DO`
+
+Item-detect coordination services used:
+
+- `item_detect/seek_complete`
+- `item_detect/repick`
+
+## IO Map
+
+| Channel | Purpose |
+| --- | --- |
+| `DO1` | Gripper close |
+| `DO2` | Gripper open |
+| `DO3` | Suction/vacuum on |
+| `DO4` | Suction cup exhaust/purge |
+| `DI1` | Active-high suction status input, read after retract |
+
+The DI status topic defaults to `/dobot_bringup_ros2/DIStatus_200mS`.
+`DI1` is read from bit `0` of the `digital_input_bits` JSON field.
 
 ## Tool Teach
 
 Each item-detect profile requires saved tool teach data before arming. The
 `tool_teach` block inside the item profile stores the Link6/tool offset,
-operator pick heights, pre-pick settling, and pickup-depth settling for that
-active item teach.
+operator pick heights, pick move speed, and pick-depth suction settle time for
+that active item teach.
 
 Embedded profile block:
 
 ```text
-WORKSPACE_ROOT/teach/item_teach/item_<item_name>[_bin_<bin_name>]_<ddmmyyyy>.yaml
+WORKSPACE_ROOT/teach/item_teach_yolo/item_<item_name>[_bin_<bin_name>]_<ddmmyyyy>.yaml
 ```
 
 The GUI can:
 
 - load embedded tool teach data for the active `item_detect` profile;
 - preview the tool offset TF in RViz;
-- save updated tool teach values with `Save Tool Teach`;
+- save the EE position settings and tool offset with `Save EE + Tool Teach`;
+- show a timestamped, scrolling Item Datalog of motion, IO, DI1, and repick steps;
 - block arming when the active item profile has no saved tool teach.
 
 Legacy `<item_name>_tool.yaml` sidecars are still readable for older profiles,
@@ -125,23 +159,50 @@ but new saves update the item profile directly.
 
 ## Motion Sequence
 
-On trigger, the node arms for a fresh `bin_seek_pose`. When the pose arrives, it:
+On trigger, the node arms for a fresh `item_seek_pose`. When the pose arrives, it:
 
-1. Builds the two valid long-axis item poses: preferred and 180-degree flipped.
-2. Prefers the pose that keeps `calibrated_camera_link` inside the active bin
-   teach footprint. If both are outside, it logs a warning and continues with
-   the preferred pose anyway.
-3. Moves with `MovL` to the approach pose above the pick goal.
-4. Opens the gripper with suction off, then waits the configured pre-pick
-   settling time.
-5. Uses `MovLIO` at 6% speed factor to move to pick depth while triggering
-   suction at the start of the descent, waits for TCP reach, then waits the
-   configured pick settling time at pickup depth.
-6. Closes the gripper, retracts to approach, waits for TCP reach, then moves to
-   final Z-up at 100% speed factor.
+1. Saves the current six robot joints as the repick start position.
+2. Waits for controller idle before calling `GetPose`, then builds the two valid
+   long-axis item poses: the least-rotation pose from the current TCP and the
+   180-degree flipped pose.
+3. Predicts where `arm_calibrated_camera_link` would be for each candidate using
+   the startup-loaded eye-on-hand calibration YAML directly. Missing or invalid
+   calibration data is a startup error. Missing active bin/profile safety data
+   blocks the pick before motion. If the least-rotation pose would put the camera
+   outside the active bin teach footprint, it uses the 180-degree candidate when
+   that keeps the camera inside. If both final orientations put the camera
+   outside the bin ROI, the node calls `item_detect/repick` for a fresh item pose
+   up to 3 times before logging `No valid item to pick` and returning to standby
+   with the node still alive.
+4. Moves with `MovJ` to the approach pose above the pick goal.
+5. Opens the gripper with suction and exhaust off.
+6. Uses `MovLIO` at the configured pick motion speed to move to pick depth.
+   The GUI/launch setting accepts `1..100%` and defaults to `10%`. `DO4`
+   exhaust is forced off at the start of descent, and `DO3` suction turns on
+   halfway down.
+7. Waits for the descent to finish, then holds at pick depth with suction active
+   for the configured `0.1..1.0s` suction settle time.
+8. Queues a `MovL` return to the approach pose at the same speed, with the
+   gripper still open and suction active. Fresh `RobotStatus` samples must show
+   the queued motion has finished and the controller has been idle for 100 ms.
+9. Reads the first fresh `DI1` sample only after the retract motion is finished.
+   When `DI1` is active, the node closes the gripper, queues final Z-up, and
+   only then calls `item_detect/seek_complete`.
+10. When that fresh `DI1` sample is inactive, final Z-up is skipped immediately.
+   With **Auto Repick** enabled, Seek remains ON, the node performs the same
+   300 ms release pulse as the **Release 300ms** button, returns by joint-mode
+   `MovJ` to the saved repick start, re-arms itself, and calls
+   `item_detect/repick`. Item Detect then publishes a newly acquired pose
+   without toggling Seek OFF. With Auto Repick disabled, the node purges, calls
+   `item_detect/seek_complete`, and returns to standby with Seek OFF.
 
-Camera-bin pose preference can be disabled with `prefer_camera_inside_bin:=false`.
-The checked frames default to `Link6` and `calibrated_camera_link`.
+TF-only preview, motion errors, failed suction, and manual Stop do not call
+`seek_complete`. The orchestrator therefore advances to placement only after
+final Z-up has been accepted. While Seek is ON, the pose watchdog reports each
+configured wait interval but remains armed instead of timing out the pick cycle.
+
+Camera-bin safety is required and fail-closed. The checked frames default to
+`Link6` and `arm_calibrated_camera_link`.
 
 ## Debug TF Frames
 
@@ -156,7 +217,7 @@ preview frames including:
 
 ## Notes
 
-- Run `item_detect` first so `bin_seek_pose` and the active profile export are
+- Run `item_detect` first so `item_seek_pose` and the active profile export are
   available.
 - Save tool teach for each new item profile before running a real pick.
 - Use troubleshoot/TF-only mode to validate target frames before enabling robot

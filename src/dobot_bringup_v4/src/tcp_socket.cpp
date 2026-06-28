@@ -31,12 +31,20 @@ void TcpClient::connect()
     sockaddr_in addr = {};
 
     memset(&addr, 0, sizeof(addr));
-    inet_pton(AF_INET, ip_.c_str(), &addr.sin_addr);
+    if (inet_pton(AF_INET, ip_.c_str(), &addr.sin_addr) != 1)
+    {
+        close();
+        throw TcpClientException(toString() + std::string(" invalid IPv4 address"));
+    }
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port_);
 
     if (::connect(fd_, (sockaddr *)&addr, sizeof(addr)) < 0)
-        throw TcpClientException(toString() + std::string(" connect : ") + strerror(errno));
+    {
+        const int saved_errno = errno;
+        close();
+        throw TcpClientException(toString() + std::string(" connect : ") + strerror(saved_errno));
+    }
     is_connected_ = true;
 
     std::cout << "connect successfully  " << toString() << std::endl;
@@ -44,12 +52,7 @@ void TcpClient::connect()
 
 void TcpClient::disConnect()
 {
-    if (is_connected_)
-    {
-        fd_ = -1;
-        is_connected_ = false;
-        ::close(fd_);
-    }
+    close();
 }
 
 bool TcpClient::isConnect() const
@@ -59,7 +62,7 @@ bool TcpClient::isConnect() const
 
 void TcpClient::tcpSend(const void *buf, uint32_t len)
 {
-    if (!is_connected_)
+    if (!is_connected_ || fd_ < 0)
         throw TcpClientException("tcp is disconnected");
 
     //std::cout << "send : " << buf << std::endl;
@@ -72,6 +75,11 @@ void TcpClient::tcpSend(const void *buf, uint32_t len)
         {
             disConnect();
             throw TcpClientException(toString() + std::string(" ::send() ") + strerror(errno));
+        }
+        else if (err == 0)
+        {
+            disConnect();
+            throw TcpClientException(toString() + std::string(" ::send() returned 0"));
         }
         len -= err;
         tmp += err;
@@ -87,6 +95,9 @@ bool TcpClient::tcpRecv(void *buf, uint32_t len, uint32_t &has_read, uint32_t ti
     has_read = 0;
     while (len)
     {
+        if (!is_connected_ || fd_ < 0)
+            throw TcpClientException("tcp is disconnected");
+
         FD_ZERO(&read_fds);
         FD_SET(fd_, &read_fds);
 

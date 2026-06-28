@@ -81,14 +81,54 @@ ros2 launch cr_robot_ros2 dobot_bringup_ros2.launch.py \
   station_config:=/absolute/path/to/station_config
 ```
 
+Robot Cell Orchestrator starts this same launch file when the operator clicks
+**Robot Bringup** in the Node Launcher. The orchestrator launch shell exports
+`DOBOT_PICKN_PLACE_ROOT` before sourcing the workspace so station-local config
+files resolve the same way from the UI and from direct terminals.
+
+## Network Behavior
+
+Bringup uses three controller TCP connections:
+
+| Port | Purpose |
+| --- | --- |
+| `29999` | dashboard command and service replies |
+| `30004` | high-rate feedback used by robot status and joint state |
+| `30005` | 200 ms feedback used by `/dobot_bringup_ros2/DIStatus_200mS` |
+
+The feedback loops reconnect after disconnects or timeouts. Dashboard service
+timeouts close the dashboard socket so the next command can reconnect cleanly
+instead of reusing a stale file descriptor. Shutdown closes the sockets and joins
+the background feedback threads before the node exits.
+
+Quick link checks:
+
+```bash
+source station_config
+ping "$ROBOT_IP_ADDRESS"
+ros2 topic echo --once dobot_msgs_v4/msg/RobotStatus
+ros2 topic echo --once /dobot_bringup_ros2/DIStatus_200mS
+```
+
+If bringup cannot connect, verify the PC interface is on the same subnet as
+`ROBOT_IP_ADDRESS`, then restart Robot Bringup so all three sockets reconnect
+from a clean process.
+
 ## Published State
 
 | Topic | Type | Notes |
 | --- | --- | --- |
 | `joint_states_robot` | `sensor_msgs/msg/JointState` | Robot joint state stream. |
-| `dobot_msgs_v4/msg/RobotStatus` | `dobot_msgs_v4/msg/RobotStatus` | Robot status and mode fields. |
+| `dobot_msgs_v4/msg/RobotStatus` | `dobot_msgs_v4/msg/RobotStatus` | Connection state, raw `robot_mode`, and `is_idle` (`mode == 5`). |
 | `dobot_msgs_v4/msg/ToolVectorActual` | `dobot_msgs_v4/msg/ToolVectorActual` | TCP pose feedback. |
 | `/dobot_bringup_ros2/msg/FeedInfo` | `std_msgs/msg/String` | JSON-like feedback payload. |
+| `/dobot_bringup_ros2/DIStatus_200mS` | `std_msgs/msg/String` | JSON DI status from the 30005 200 ms feedback stream. |
+
+Check the 200 ms DI status stream:
+
+```bash
+ros2 topic echo --field data /dobot_bringup_ros2/DIStatus_200mS
+```
 
 ## Services
 

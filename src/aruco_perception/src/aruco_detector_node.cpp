@@ -59,6 +59,16 @@ double stampDiffSec(const rclcpp::Time &a, const rclcpp::Time &b)
 {
   return std::fabs((a - b).seconds());
 }
+
+std::string normalizeFrameId(const std::string &frame_id)
+{
+  std::string normalized = frame_id;
+  while (!normalized.empty() && normalized.front() == '/')
+  {
+    normalized.erase(normalized.begin());
+  }
+  return normalized;
+}
 }  // namespace
 
 ArucoDetectorNode::ArucoDetectorNode()
@@ -76,14 +86,16 @@ ArucoDetectorNode::ArucoDetectorNode()
     "detections_topic", "/aruco_detections");
   use_calibration_ = this->declare_parameter<bool>("use_calibration", true);
   publish_static_calibration_tf_ = this->declare_parameter<bool>("publish_static_calibration_tf", true);
+  publish_marker_tfs_ = this->declare_parameter<bool>("publish_marker_tfs", true);
   calibration_file_ = this->declare_parameter<std::string>("calibration_file", "");
   calibration_parent_frame_ = this->declare_parameter<std::string>("calibration_parent_frame", "Link6");
   calibration_child_frame_ = this->declare_parameter<std::string>(
-    "calibration_child_frame", "calibrated_camera_link");
+    "calibration_child_frame", "arm_calibrated_camera_link");
   marker_frame_prefix_ = "aruco_marker";
   const std::string default_camera_frame =
-    use_calibration_ ? calibration_child_frame_ : std::string("camera_link");
+    use_calibration_ ? calibration_child_frame_ : std::string("robot_camera_color_optical_frame");
   camera_frame_id_ = this->declare_parameter<std::string>("camera_frame", default_camera_frame);
+  camera_frame_id_ = normalizeFrameId(camera_frame_id_);
   target_marker_id_ = -1;
   sync_tolerance_sec_ = 0.1;
   depth_average_kernel_ = 5;
@@ -91,6 +103,11 @@ ArucoDetectorNode::ArucoDetectorNode()
   publish_overlay_ = this->declare_parameter<bool>("publish_overlay", true);
   publish_viz_ = publish_overlay_ || show_overlay_window_;
   overlay_rate_hz_ = this->declare_parameter<double>("overlay_rate_hz", 10.0);
+  show_bin_roi_dots_overlay_ = this->declare_parameter<bool>("show_bin_roi_dots_overlay", false);
+  bin_roi_allowed_marker_ids_ = this->declare_parameter<std::vector<int64_t>>(
+    "bin_roi_allowed_marker_ids", std::vector<int64_t>{1, 2, 3, 4});
+  bin_roi_required_marker_count_ = this->declare_parameter<int>("bin_roi_required_marker_count", 4);
+  bin_roi_required_marker_count_ = std::max(1, bin_roi_required_marker_count_);
   depth_colormap_max_ = 1.5;
   overlay_axis_scale_ = DEFAULT_AXIS_SCALE;
   overlay_axis_min_len_ = DEFAULT_AXIS_MIN_LEN;
@@ -249,13 +266,13 @@ rcl_interfaces::msg::SetParametersResult ArucoDetectorNode::handleParameterUpdat
     const std::string value = parameter.as_string();
     if (name == "camera_frame")
     {
-      if (value.empty())
+      new_camera_frame = normalizeFrameId(value);
+      if (new_camera_frame.empty())
       {
         result.successful = false;
         result.reason = name + " must be non-empty.";
         return result;
       }
-      new_camera_frame = value.front() == '/' ? value.substr(1) : value;
       continue;
     }
     if (value.empty() || value.front() != '/')
@@ -390,6 +407,51 @@ void ArucoDetectorNode::processFrame(const ImageMsg::ConstSharedPtr &color,
   cv_bridge::CvImageConstPtr color_cv;
   cv_bridge::CvImageConstPtr depth_cv;
 
+  const std::string color_frame = normalizeFrameId(color->header.frame_id);
+  const std::string depth_frame = normalizeFrameId(depth->header.frame_id);
+  const std::string info_frame = normalizeFrameId(info->header.frame_id);
+  if (!color_frame.empty() && color_frame != camera_frame_id_)
+  {
+    if (!use_calibration_)
+    {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *this->get_clock(), 2000,
+        "Color image frame_id is '%s' but detector camera_frame is '%s'; not publishing ArUco poses.",
+        color_frame.c_str(), camera_frame_id_.c_str());
+      return;
+    }
+    RCLCPP_INFO_ONCE(
+      get_logger(),
+      "Color image frame_id is '%s'; calibrated ArUco poses will be published in '%s'.",
+      color_frame.c_str(), camera_frame_id_.c_str());
+  }
+  const std::string expected_info_frame = color_frame.empty() ? camera_frame_id_ : color_frame;
+  if (!info_frame.empty() && info_frame != expected_info_frame)
+  {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *this->get_clock(), 2000,
+      "CameraInfo frame_id is '%s' but color/camera frame is '%s'; not publishing ArUco poses.",
+      info_frame.c_str(), expected_info_frame.c_str());
+    return;
+  }
+  if (!depth_frame.empty() && !color_frame.empty() && depth_frame != color_frame)
+  {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *this->get_clock(), 5000,
+      "Depth image frame_id is '%s' while color frame_id is '%s'; continuing only because "
+      "depth_registration/align-to-color is expected.",
+      depth_frame.c_str(), color_frame.c_str());
+  }
+  if (!std::isfinite(info->k[0]) || !std::isfinite(info->k[4]) ||
+      info->k[0] <= 1e-6 || info->k[4] <= 1e-6)
+  {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *this->get_clock(), 2000,
+      "Invalid camera intrinsics fx=%.6f fy=%.6f; not publishing ArUco poses.",
+      info->k[0], info->k[4]);
+    return;
+  }
+
   try
   {
     color_cv = cv_bridge::toCvShare(color, sensor_msgs::image_encodings::BGR8);
@@ -426,6 +488,16 @@ void ArucoDetectorNode::processFrame(const ImageMsg::ConstSharedPtr &color,
   catch (const cv_bridge::Exception &ex)
   {
     RCLCPP_WARN(get_logger(), "Failed to convert depth image: %s", ex.what());
+    return;
+  }
+
+  if (depth_cv->image.cols != color_cv->image.cols || depth_cv->image.rows != color_cv->image.rows)
+  {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *this->get_clock(), 2000,
+      "Depth image size (%d x %d) does not match color image size (%d x %d); "
+      "depth must be registered to color for ArUco pose estimation.",
+      depth_cv->image.cols, depth_cv->image.rows, color_cv->image.cols, color_cv->image.rows);
     return;
   }
 
@@ -492,24 +564,27 @@ void ArucoDetectorNode::processFrame(const ImageMsg::ConstSharedPtr &color,
     {
       marker_frame += "_" + std::to_string(instance_index);
     }
-    geometry_msgs::msg::TransformStamped tf_msg;
-    tf_msg.header.stamp = pose_msg.header.stamp;
-    tf_msg.header.frame_id = camera_frame_id_;
-    tf_msg.child_frame_id = marker_frame;
-    tf_msg.transform.translation.x = marker.pose.translation().x();
-    tf_msg.transform.translation.y = marker.pose.translation().y();
-    tf_msg.transform.translation.z = marker.pose.translation().z();
+    if (publish_marker_tfs_)
+    {
+      geometry_msgs::msg::TransformStamped tf_msg;
+      tf_msg.header.stamp = pose_msg.header.stamp;
+      tf_msg.header.frame_id = camera_frame_id_;
+      tf_msg.child_frame_id = marker_frame;
+      tf_msg.transform.translation.x = marker.pose.translation().x();
+      tf_msg.transform.translation.y = marker.pose.translation().y();
+      tf_msg.transform.translation.z = marker.pose.translation().z();
 
-    Eigen::Quaterniond q(marker.pose.rotation());
-    q.normalize();
-    tf2::Quaternion tf_q(q.x(), q.y(), q.z(), q.w());
-    tf_msg.transform.rotation = tf2::toMsg(tf_q);
-    tf_broadcaster_->sendTransform(tf_msg);
+      Eigen::Quaterniond q(marker.pose.rotation());
+      q.normalize();
+      tf2::Quaternion tf_q(q.x(), q.y(), q.z(), q.w());
+      tf_msg.transform.rotation = tf2::toMsg(tf_q);
+      tf_broadcaster_->sendTransform(tf_msg);
 
-    RCLCPP_INFO_THROTTLE(
-      get_logger(), *this->get_clock(), 2000,
-      "Marker %d pose published as %s in frame %s.",
-      marker.id, marker_frame.c_str(), camera_frame_id_.c_str());
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *this->get_clock(), 2000,
+        "Marker %d pose published as %s in frame %s.",
+        marker.id, marker_frame.c_str(), camera_frame_id_.c_str());
+    }
   }
 
   if (publish_viz_)
@@ -546,6 +621,8 @@ void ArucoDetectorNode::publishDetections(const rclcpp::Time &image_stamp,
   msg.poses.reserve(markers.size());
   msg.pixel_centers.reserve(markers.size());
   msg.pixel_corners.reserve(markers.size());
+  msg.camera_centers.reserve(markers.size());
+  msg.camera_corners.reserve(markers.size());
 
   for (const auto &marker : markers)
   {
@@ -579,6 +656,24 @@ void ArucoDetectorNode::publishDetections(const rclcpp::Time &image_stamp,
       corner_msg.points.push_back(point);
     }
     msg.pixel_corners.push_back(corner_msg);
+
+    geometry_msgs::msg::Point camera_center_msg;
+    camera_center_msg.x = marker.center_cam.x();
+    camera_center_msg.y = marker.center_cam.y();
+    camera_center_msg.z = marker.center_cam.z();
+    msg.camera_centers.push_back(camera_center_msg);
+
+    geometry_msgs::msg::Polygon camera_corner_msg;
+    camera_corner_msg.points.reserve(marker.cam_corners.size());
+    for (const auto &corner : marker.cam_corners)
+    {
+      geometry_msgs::msg::Point32 point;
+      point.x = static_cast<float>(corner.x());
+      point.y = static_cast<float>(corner.y());
+      point.z = static_cast<float>(corner.z());
+      camera_corner_msg.points.push_back(point);
+    }
+    msg.camera_corners.push_back(camera_corner_msg);
   }
 
   detections_pub_->publish(msg);
@@ -710,6 +805,8 @@ void ArucoDetectorNode::publishOverlay(const rclcpp::Time &stamp, const cv::Mat 
     }
   }
 
+  drawBinRoiDotsOverlay(color_overlay, depth_overlay, markers);
+
   cv::Mat stacked;
   cv::vconcat(color_overlay, depth_overlay, stacked);
 
@@ -749,6 +846,157 @@ void ArucoDetectorNode::publishOverlay(const rclcpp::Time &stamp, const cv::Mat 
     processOverlayWindowEvents();
   }
   last_overlay_render_time_ = std::chrono::steady_clock::now();
+}
+
+void ArucoDetectorNode::drawBinRoiDotsOverlay(
+  cv::Mat &color_overlay, cv::Mat &depth_overlay,
+  const std::vector<MarkerPose> &markers) const
+{
+  if (!show_bin_roi_dots_overlay_ || markers.empty() || bin_roi_required_marker_count_ <= 0)
+  {
+    return;
+  }
+
+  std::vector<const MarkerPose *> selected;
+  selected.reserve(static_cast<size_t>(bin_roi_required_marker_count_));
+  for (const auto &marker : markers)
+  {
+    if (std::find(
+          bin_roi_allowed_marker_ids_.begin(),
+          bin_roi_allowed_marker_ids_.end(),
+          static_cast<int64_t>(marker.id)) == bin_roi_allowed_marker_ids_.end())
+    {
+      continue;
+    }
+    if (marker.image_corners.size() < 4)
+    {
+      continue;
+    }
+    selected.push_back(&marker);
+    if (static_cast<int>(selected.size()) >= bin_roi_required_marker_count_)
+    {
+      break;
+    }
+  }
+
+  if (static_cast<int>(selected.size()) < bin_roi_required_marker_count_)
+  {
+    return;
+  }
+
+  cv::Point2f center_px(0.0F, 0.0F);
+  for (const auto *marker : selected)
+  {
+    cv::Point2f marker_center(0.0F, 0.0F);
+    for (const auto &corner : marker->image_corners)
+    {
+      marker_center += corner;
+    }
+    marker_center *= (1.0F / static_cast<float>(marker->image_corners.size()));
+    center_px += marker_center;
+  }
+  center_px *= (1.0F / static_cast<float>(selected.size()));
+
+  std::vector<cv::Point> points;
+  points.reserve(selected.size());
+  for (const auto *marker : selected)
+  {
+    size_t outside_index = 0;
+    double best_distance = -1.0;
+    for (size_t index = 0; index < 4; ++index)
+    {
+      const cv::Point2f delta = marker->image_corners[index] - center_px;
+      const double distance = static_cast<double>(delta.x) * static_cast<double>(delta.x) +
+                              static_cast<double>(delta.y) * static_cast<double>(delta.y);
+      if (distance > best_distance)
+      {
+        best_distance = distance;
+        outside_index = index;
+      }
+    }
+    const auto &corner = marker->image_corners[outside_index];
+    points.emplace_back(
+      static_cast<int>(std::lround(corner.x)),
+      static_cast<int>(std::lround(corner.y)));
+  }
+
+  if (points.size() < 3)
+  {
+    return;
+  }
+
+  cv::Point2d point_center(0.0, 0.0);
+  for (const auto &point : points)
+  {
+    point_center.x += static_cast<double>(point.x);
+    point_center.y += static_cast<double>(point.y);
+  }
+  point_center.x /= static_cast<double>(points.size());
+  point_center.y /= static_cast<double>(points.size());
+
+  std::sort(
+    points.begin(), points.end(),
+    [&point_center](const cv::Point &a, const cv::Point &b) {
+      const double angle_a = std::atan2(
+        static_cast<double>(a.y) - point_center.y,
+        static_cast<double>(a.x) - point_center.x);
+      const double angle_b = std::atan2(
+        static_cast<double>(b.y) - point_center.y,
+        static_cast<double>(b.x) - point_center.x);
+      return angle_a < angle_b;
+    });
+
+  const auto start_it = std::min_element(
+    points.begin(), points.end(),
+    [](const cv::Point &a, const cv::Point &b) {
+      return (a.x + a.y) < (b.x + b.y);
+    });
+  std::rotate(points.begin(), start_it, points.end());
+  if (points.size() >= 4 && points[1].x < points.back().x)
+  {
+    std::reverse(points.begin() + 1, points.end());
+  }
+
+  const cv::Scalar line_color(255, 255, 0);
+  const cv::Scalar fill_color(255, 0, 255);
+  const cv::Scalar text_color(255, 255, 255);
+  const cv::Scalar shadow_color(0, 0, 0);
+
+  auto draw_points = [&](cv::Mat &image) {
+    std::vector<cv::Point> clipped_points;
+    clipped_points.reserve(points.size());
+    for (const auto &point : points)
+    {
+      clipped_points.emplace_back(
+        std::clamp(point.x, 0, std::max(0, image.cols - 1)),
+        std::clamp(point.y, 0, std::max(0, image.rows - 1)));
+    }
+
+    const std::vector<std::vector<cv::Point>> polygon{clipped_points};
+    cv::polylines(image, polygon, true, line_color, 4, cv::LINE_AA);
+    for (size_t index = 0; index < clipped_points.size(); ++index)
+    {
+      const auto &point = clipped_points[index];
+      cv::circle(image, point, 24, shadow_color, -1, cv::LINE_AA);
+      cv::circle(image, point, 18, fill_color, -1, cv::LINE_AA);
+      cv::circle(image, point, 27, text_color, 3, cv::LINE_AA);
+      cv::drawMarker(image, point, text_color, cv::MARKER_CROSS, 34, 3, cv::LINE_AA);
+
+      const std::string label = "dot " + std::to_string(index + 1);
+      const cv::Point label_point(
+        std::clamp(point.x + 24, 4, std::max(4, image.cols - 90)),
+        std::clamp(point.y - 24, 24, std::max(24, image.rows - 8)));
+      cv::putText(
+        image, label, label_point, cv::FONT_HERSHEY_SIMPLEX, 0.72,
+        shadow_color, 5, cv::LINE_AA);
+      cv::putText(
+        image, label, label_point, cv::FONT_HERSHEY_SIMPLEX, 0.72,
+        text_color, 2, cv::LINE_AA);
+    }
+  };
+
+  draw_points(color_overlay);
+  draw_points(depth_overlay);
 }
 
 void ArucoDetectorNode::renderNoCameraTopicsOverlay()

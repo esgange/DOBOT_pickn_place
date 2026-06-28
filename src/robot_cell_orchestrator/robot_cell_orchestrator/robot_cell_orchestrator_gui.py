@@ -1,4 +1,5 @@
 import json
+import ipaddress
 import os
 import queue
 import shlex
@@ -18,13 +19,13 @@ import cv2
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
-from dobot_msgs_v4.msg import ToolVectorActual
+from dobot_msgs_v4.msg import RobotStatus
 from dobot_msgs_v4.srv import LoadOnlineProgram, TrayInterceptStart
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
-from std_srvs.srv import Trigger
+from std_srvs.srv import SetBool, Trigger
 
 try:
     import yaml
@@ -35,7 +36,9 @@ except Exception:  # pragma: no cover - runtime fallback for minimal installs
 ITEM_GO_TO_TEACH_SERVICE_DEFAULT = 'item_detect/go_to_teach'
 ITEM_ARM_SERVICE_DEFAULT = 'item_pick/track'
 ITEM_ARM_STATUS_SERVICE_DEFAULT = 'item_pick/track_status'
+ITEM_AUTO_REPICK_SERVICE_DEFAULT = 'item_pick/set_auto_repick'
 ITEM_SEEK_SERVICE_DEFAULT = 'item_detect/seek'
+ITEM_REPICK_SERVICE_DEFAULT = 'item_detect/repick'
 ITEM_SEEK_STATUS_SERVICE_DEFAULT = 'item_detect/seek_status'
 TRAY_GO_TO_TEACH_SERVICE_DEFAULT = 'tray_detect/go_to_teach'
 TRAY_ARM_SERVICE_DEFAULT = 'tray_intercept/start_sequence'
@@ -46,18 +49,17 @@ ONLINE_START_SERVICE_DEFAULT = 'robot_cell_orchestrator/start_online'
 ONLINE_LOAD_PROGRAM_SERVICE_DEFAULT = 'robot_cell_orchestrator/load_online_program'
 ONLINE_VALIDATE_SERVICE_DEFAULT = 'robot_cell_orchestrator/validate_online_program'
 ONLINE_PLACE_SERVICE_DEFAULT = 'robot_cell_orchestrator/place_online'
+NOMACHINE_SERVICE_DISPLAY = './NoMachine/remote_ready_ubuntu22.sh'
 PHASE_EVENT_TOPIC_DEFAULT = 'robot_cell_orchestrator/events'
-ROBOT_TCP_TOPIC_DEFAULT = '/dobot_msgs_v4/msg/ToolVectorActual'
+ROBOT_STATUS_TOPIC_DEFAULT = 'dobot_msgs_v4/msg/RobotStatus'
 BIN_DETECT_OVERLAY_TOPIC_DEFAULT = 'bin_overlay'
 TRAY_DETECT_OVERLAY_TOPIC_DEFAULT = 'tray_overlay'
 
-ROBOT_LINEAR_MOVE_EPS_MM = 1.0
-ROBOT_ROT_MOVE_EPS_DEG = 1.0
 ROBOT_STABILITY_SEC_DEFAULT = 0.5
 TIMING_SLIDER_MIN_SEC = 0.1
 TIMING_SLIDER_MAX_SEC = 1.0
 TIMING_SLIDER_STEP_SEC = 0.1
-ROBOT_TCP_STALE_SEC = 1.0
+ROBOT_STATUS_STALE_SEC = 1.0
 ROBOT_MONITOR_TIMEOUT_SEC = 30.0
 SEEK_STATUS_POLL_SEC = 0.1
 SEEK_STATUS_RESPONSE_TIMEOUT_SEC = 0.2
@@ -81,6 +83,7 @@ PROCESS_SCAN_MS = 1000
 RUNTIME_SETTINGS_SAVE_DEBOUNCE_MS = 250
 PROCESS_STOP_TIMEOUT_SEC = 3.0
 PROCESS_TERMINAL_PID_WAIT_SEC = 2.0
+NOMACHINE_STATUS_CACHE_SEC = 5.0
 RUNNING_BUTTON_BG = '#d9ead3'
 CAMERA_VIEW_WIDTH = 720
 CAMERA_VIEW_HEIGHT = 405
@@ -90,6 +93,14 @@ CAMERA_WINDOW_DEFAULT_WIDTH = CAMERA_VIEW_WIDTH + 70
 CAMERA_WINDOW_DEFAULT_HEIGHT = (CAMERA_VIEW_HEIGHT * 2) + 150
 CAMERA_VIEW_REFRESH_MS = 120
 CAMERA_VIEW_STALE_SEC = 2.0
+
+ROBOT_MODE_ENABLED = 5
+ROBOT_MODE_RUNNING = 7
+ROBOT_MODE_ERROR = 9
+ROBOT_MODE_PAUSED = 10
+ROBOT_MODE_JOGGING = 11
+ROBOT_MODE_ACTIVE_CODES = (ROBOT_MODE_RUNNING, ROBOT_MODE_JOGGING)
+ROBOT_MODE_FAILURE_CODES = (ROBOT_MODE_ERROR, ROBOT_MODE_PAUSED)
 
 MODE_OFFLINE = 'offline'
 MODE_ONLINE = 'online'
@@ -122,6 +133,11 @@ CALIBRATION_PATTERNS = {
     'Eye-to-hand': 'axab_calibration_eyetohand_*.yaml',
     'Platform': 'platform_calibration_*.yaml',
 }
+CALIBRATION_EYE_ON_HAND = 'Eye-on-hand'
+CALIBRATION_EYE_TO_HAND = 'Eye-to-hand'
+CALIBRATION_PLATFORM = 'Platform'
+ROBOT_IP_CONFIG_KEY = 'ROBOT_IP_ADDRESS'
+ROBOT_LAN2_DEFAULT_IP = '192.168.200.1'
 
 
 def _looks_like_workspace_root(path: Path) -> bool:
@@ -169,6 +185,7 @@ def ros_sourced_shell_command(cmd: list[str], *, source_python_venv: bool = True
         'set -e; '
         f'ROOT="${{DOBOT_PICKN_PLACE_ROOT:-{root}}}"; '
         'cd "$ROOT"; '
+        'export DOBOT_PICKN_PLACE_ROOT="$ROOT"; '
         'if [ -f /opt/ros/humble/setup.bash ]; then source /opt/ros/humble/setup.bash; fi; '
         'if [ -f "$ROOT/install/setup.bash" ]; then source "$ROOT/install/setup.bash"; fi; '
         f'{venv_source}'
@@ -179,6 +196,7 @@ def ros_sourced_shell_command(cmd: list[str], *, source_python_venv: bool = True
 def ros_child_environment() -> dict[str, str]:
     env = os.environ.copy()
     env['DOBOT_PICKN_PLACE_ROOT'] = str(workspace_root())
+    env['ROS_LOCALHOST_ONLY'] = '1'
     return env
 
 
@@ -301,6 +319,79 @@ def key_value_config(path: Path) -> dict[str, str]:
     return values
 
 
+def update_key_value_config(path: Path, key: str, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lines = path.read_text(encoding='utf-8').splitlines(keepends=True)
+    except FileNotFoundError:
+        lines = []
+
+    updated = False
+    output: list[str] = []
+    for raw_line in lines:
+        newline = '\n' if raw_line.endswith('\n') else ''
+        content = raw_line[:-1] if newline else raw_line
+        stripped = content.strip()
+        if not stripped or stripped.startswith('#') or '=' not in stripped:
+            output.append(raw_line)
+            continue
+
+        leading = content[:len(content) - len(content.lstrip())]
+        body = content.lstrip()
+        export_prefix = ''
+        if body.startswith('export '):
+            export_prefix = 'export '
+            body = body[len('export '):].strip()
+        raw_key, _raw_value = body.split('=', 1)
+        if raw_key.strip() == key:
+            output.append(f'{leading}{export_prefix}{key}={value}{newline}')
+            updated = True
+        else:
+            output.append(raw_line)
+
+    if not updated:
+        if output and not output[-1].endswith('\n'):
+            output[-1] += '\n'
+        if output and output[-1].strip():
+            output.append('\n')
+        output.append(f'{key}={value}\n')
+
+    path.write_text(''.join(output), encoding='utf-8')
+
+
+def normalize_ipv4_address(value: str) -> str | None:
+    candidate = str(value or '').strip()
+    if not candidate:
+        return None
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        return None
+    if address.version != 4:
+        return None
+    return str(address)
+
+
+def sanitize_filename_token(value: str) -> str:
+    token: list[str] = []
+    previous_underscore = False
+    for ch in str(value or '').strip():
+        if ch.isalnum() or ch in '._-':
+            token.append(ch)
+            previous_underscore = False
+        elif not previous_underscore:
+            token.append('_')
+            previous_underscore = True
+    return ''.join(token).strip('_')
+
+
+def calibration_path_matches_robot_ip(path: Path, robot_ip_address: str) -> bool:
+    ip_token = sanitize_filename_token(robot_ip_address)
+    if not ip_token:
+        return False
+    return path.stem.endswith(f'_{ip_token}')
+
+
 def _load_yaml_mapping(path: Path) -> dict | None:
     if yaml is None:
         return None
@@ -349,6 +440,27 @@ def classify_teach_yaml(path: Path) -> str:
     return 'unknown'
 
 
+def classify_calibration_yaml(path: Path) -> str:
+    payload = _load_yaml_mapping(path)
+    if not isinstance(payload, dict) or not isinstance(payload.get('transform'), dict):
+        return 'unknown'
+
+    parameters = payload.get('parameters')
+    if isinstance(parameters, dict):
+        calibration_type = str(parameters.get('calibration_type', '')).strip().lower()
+        if calibration_type in ('eye_in_hand', 'eye_on_hand', 'eyeonhand'):
+            return CALIBRATION_EYE_ON_HAND
+        if calibration_type in ('eye_on_base', 'eye_to_hand', 'eyetohand'):
+            return CALIBRATION_EYE_TO_HAND
+
+    metadata = payload.get('metadata')
+    if isinstance(metadata, dict):
+        calibration_type = str(metadata.get('calibration_type', '')).strip().lower()
+        if calibration_type == 'platform_reference':
+            return CALIBRATION_PLATFORM
+    return 'unknown'
+
+
 def item_profile_has_embedded_tool_teach(path: Path | None) -> bool:
     if path is None or not path.exists():
         return False
@@ -363,16 +475,6 @@ def yaml_files_in(path: Path) -> list[Path]:
         [candidate for candidate in path.iterdir() if candidate.is_file() and candidate.suffix in ('.yaml', '.yml')],
         key=lambda candidate: candidate.name.lower(),
     )
-
-
-def latest_file(pattern_dir: Path, pattern: str) -> Path | None:
-    candidates = [
-        path for path in pattern_dir.glob(pattern)
-        if path.is_file() and path.stat().st_size > 0
-    ]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
 def file_label(path: Path | None) -> str:
@@ -455,11 +557,15 @@ class CameraViewFrame:
 @dataclass(frozen=True)
 class RobotCellOrchestratorRuntimeSettings:
     loop_enabled: bool
+    auto_repick_enabled: bool
     step_mode_enabled: bool
     tray_seek_stability_sec: float
     tray_intercept_x_offset_mm: float
     tray_intercept_y_offset_mm: float
     tray_ee_angle_deg: float
+    eye_on_hand_calibration_file: str = ''
+    eye_to_hand_calibration_file: str = ''
+    platform_calibration_file: str = ''
     window_geometry: str = '1180x850'
 
 
@@ -593,7 +699,15 @@ class RobotCellOrchestratorNode(Node):
             'item_arm_status_service',
             ITEM_ARM_STATUS_SERVICE_DEFAULT,
         )
+        self.item_auto_repick_service = self._declare_name_parameter(
+            'item_auto_repick_service',
+            ITEM_AUTO_REPICK_SERVICE_DEFAULT,
+        )
         self.item_seek_service = self._declare_name_parameter('item_seek_service', ITEM_SEEK_SERVICE_DEFAULT)
+        self.item_repick_service = self._declare_name_parameter(
+            'item_repick_service',
+            ITEM_REPICK_SERVICE_DEFAULT,
+        )
         self.item_seek_status_service = self._declare_name_parameter(
             'item_seek_status_service',
             ITEM_SEEK_STATUS_SERVICE_DEFAULT,
@@ -632,7 +746,10 @@ class RobotCellOrchestratorNode(Node):
             'phase_event_topic',
             PHASE_EVENT_TOPIC_DEFAULT,
         )
-        self.robot_tcp_topic = self._declare_name_parameter('robot_tcp_topic', ROBOT_TCP_TOPIC_DEFAULT)
+        self.robot_status_topic = self._declare_name_parameter(
+            'robot_status_topic',
+            ROBOT_STATUS_TOPIC_DEFAULT,
+        )
         self.bin_detect_overlay_topic = self._declare_name_parameter(
             'bin_detect_overlay_topic',
             BIN_DETECT_OVERLAY_TOPIC_DEFAULT,
@@ -642,12 +759,14 @@ class RobotCellOrchestratorNode(Node):
             TRAY_DETECT_OVERLAY_TOPIC_DEFAULT,
         )
         self._tray_arm_client = self.create_client(TrayInterceptStart, self.tray_arm_service)
+        self._item_auto_repick_client = self.create_client(SetBool, self.item_auto_repick_service)
 
         self._trigger_clients: dict[str, tuple[str, object]] = {
             'item_go_to_teach': (self.item_go_to_teach_service, self.create_client(Trigger, self.item_go_to_teach_service)),
             'item_arm': (self.item_arm_service, self.create_client(Trigger, self.item_arm_service)),
             'item_arm_status': (self.item_arm_status_service, self.create_client(Trigger, self.item_arm_status_service)),
             'item_seek': (self.item_seek_service, self.create_client(Trigger, self.item_seek_service)),
+            'item_repick': (self.item_repick_service, self.create_client(Trigger, self.item_repick_service)),
             'item_seek_status': (self.item_seek_status_service, self.create_client(Trigger, self.item_seek_status_service)),
             'tray_go_to_teach': (self.tray_go_to_teach_service, self.create_client(Trigger, self.tray_go_to_teach_service)),
             'tray_arm_status': (self.tray_arm_status_service, self.create_client(Trigger, self.tray_arm_status_service)),
@@ -656,6 +775,8 @@ class RobotCellOrchestratorNode(Node):
         }
         self._startup_service_result: TriggerResult | None = None
         self._startup_service_lock = threading.Lock()
+        self._nomachine_status_checked_at = 0.0
+        self._nomachine_status_ready = False
         self._online_load_program_handler: Callable[[OnlineProgramLoad], OnlineProgramLoadResult] | None = None
         self._online_load_program_handler_lock = threading.Lock()
         self._online_start_handler: Callable[[], TriggerResult] | None = None
@@ -679,16 +800,23 @@ class RobotCellOrchestratorNode(Node):
         self._phase_event_pub = self.create_publisher(String, self.phase_event_topic, 10)
         self._phase_event_seq = 0
         self._phase_event_lock = threading.Lock()
-        self._tcp_condition = threading.Condition()
-        self._tcp_seq = 0
-        self._latest_tcp: tuple[float, float, float, float, float, float] | None = None
-        self._last_tcp_receive_time = 0.0
+        self._robot_status_condition = threading.Condition()
+        self._robot_status_seq = 0
+        self._latest_robot_mode: int | None = None
+        self._latest_robot_idle = False
+        self._latest_robot_connected = False
+        self._last_robot_status_receive_time = 0.0
         self._camera_bridge = CvBridge()
         self._camera_frame_lock = threading.Lock()
         self._camera_frames: dict[str, CameraViewFrame] = {}
         self._camera_error_log_time: dict[str, float] = {}
 
-        self.create_subscription(ToolVectorActual, self.robot_tcp_topic, self._tcp_callback, 10)
+        self.create_subscription(
+            RobotStatus,
+            self.robot_status_topic,
+            self._robot_status_callback,
+            10,
+        )
         self.create_subscription(
             Image,
             self.bin_detect_overlay_topic,
@@ -803,14 +931,21 @@ class RobotCellOrchestratorNode(Node):
         return phase_id
 
     def _required_service_clients(self) -> list[tuple[str, object]]:
-        return [*self._trigger_clients.values(), (self.tray_arm_service, self._tray_arm_client)]
+        return [
+            *self._trigger_clients.values(),
+            (self.item_auto_repick_service, self._item_auto_repick_client),
+            (self.tray_arm_service, self._tray_arm_client),
+        ]
 
     def service_names(self) -> list[tuple[str, str]]:
         return [
+            ('NoMachine Remote Access', NOMACHINE_SERVICE_DISPLAY),
             ('Item Go Teach', self.item_go_to_teach_service),
             ('Item Pick Arm', self.item_arm_service),
             ('Item Pick Arm Status', self.item_arm_status_service),
+            ('Item Pick Auto Repick', self.item_auto_repick_service),
             ('Item Seek', self.item_seek_service),
+            ('Item Repick', self.item_repick_service),
             ('Item Seek Status', self.item_seek_status_service),
             ('Tray Go Teach', self.tray_go_to_teach_service),
             ('Tray Intercept Arm Start', self.tray_arm_service),
@@ -825,7 +960,7 @@ class RobotCellOrchestratorNode(Node):
 
     def topic_names(self) -> list[tuple[str, str]]:
         return [
-            ('Robot Feedback', self.robot_tcp_topic),
+            ('Robot Status', self.robot_status_topic),
             ('Bin Detect Overlay', self.bin_detect_overlay_topic),
             ('Tray Detect Overlay', self.tray_detect_overlay_topic),
         ]
@@ -874,20 +1009,57 @@ class RobotCellOrchestratorNode(Node):
             for service_name, client in self._required_service_clients()
             if not client.service_is_ready()
         ]
+        missing_topics = []
+        if self.count_publishers(self.robot_status_topic) < 1:
+            missing_topics.append(self.robot_status_topic)
         if missing_names:
-            return TriggerResult(False, 'Required services unavailable: ' + ', '.join(missing_names))
-        return TriggerResult(True, f'All {len(self._required_service_clients())} services ready')
+            message = 'Required services unavailable: ' + ', '.join(missing_names)
+            if missing_topics:
+                message += '; required topics unavailable: ' + ', '.join(missing_topics)
+            return TriggerResult(False, message)
+        if missing_topics:
+            return TriggerResult(False, 'Required topics unavailable: ' + ', '.join(missing_topics))
+        return TriggerResult(
+            True,
+            f'All {len(self._required_service_clients())} services ready; robot status topic publishing',
+        )
 
     def service_readiness_map(self) -> dict[str, bool]:
         readiness = {
             service_name: bool(client.service_is_ready())
             for service_name, client in self._required_service_clients()
         }
+        readiness[NOMACHINE_SERVICE_DISPLAY] = self.nomachine_remote_access_ready()
         readiness[self.online_load_program_service] = True
         readiness[self.online_start_service] = True
         readiness[self.online_validate_service] = True
         readiness[self.online_place_service] = True
         return readiness
+
+    def nomachine_remote_access_ready(self) -> bool:
+        now = time.monotonic()
+        if now - self._nomachine_status_checked_at < NOMACHINE_STATUS_CACHE_SEC:
+            return self._nomachine_status_ready
+        self._nomachine_status_checked_at = now
+        nxserver = Path('/etc/NX/nxserver')
+        if not nxserver.exists():
+            self._nomachine_status_ready = False
+            return False
+        try:
+            result = subprocess.run(
+                [str(nxserver), '--status'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=1.5,
+                check=False,
+            )
+            self._nomachine_status_ready = result.returncode == 0
+        except Exception:
+            self._nomachine_status_ready = False
+        return self._nomachine_status_ready
+
+    def invalidate_nomachine_remote_access_status(self) -> None:
+        self._nomachine_status_checked_at = 0.0
 
     def _cache_startup_service_result(self, result: TriggerResult) -> None:
         with self._startup_service_lock:
@@ -917,67 +1089,76 @@ class RobotCellOrchestratorNode(Node):
     def _require_startup_services(self) -> TriggerResult:
         return self.check_trigger_services_now()
 
-    def robot_pose_snapshot(self) -> tuple[float, float, float, float, float, float] | None:
-        with self._tcp_condition:
-            return self._latest_tcp
+    def robot_mode_snapshot(self) -> int | None:
+        with self._robot_status_condition:
+            return self._latest_robot_mode
 
-    def wait_for_robot_stable(self, stop_event: threading.Event, stability_sec: float) -> TriggerResult:
+    def wait_for_robot_idle(self, stop_event: threading.Event, stability_sec: float) -> TriggerResult:
         stability_sec = max(0.0, float(stability_sec))
-        deadline = time.monotonic() + ROBOT_MONITOR_TIMEOUT_SEC
-        stable_anchor_pose: tuple[float, float, float, float, float, float] | None = None
-        stable_since: float | None = None
-        stable_elapsed = 0.0
-        last_seq = -1
-        last_linear_delta = 0.0
-        last_rot_delta = 0.0
-        with self._tcp_condition:
+        started = time.monotonic()
+        deadline = started + ROBOT_MONITOR_TIMEOUT_SEC
+        idle_since: float | None = None
+        idle_elapsed = 0.0
+        saw_active_motion = False
+        last_mode: int | None = None
+
+        with self._robot_status_condition:
             while rclpy.ok():
                 now = time.monotonic()
-                if self._latest_tcp is not None and (now - self._last_tcp_receive_time) <= ROBOT_TCP_STALE_SEC:
-                    if stable_anchor_pose is None:
-                        stable_anchor_pose = self._latest_tcp
-                        stable_since = self._last_tcp_receive_time
-                        last_seq = self._tcp_seq
-                    elif self._tcp_seq != last_seq:
-                        linear_delta, rot_delta = self._pose_delta(self._latest_tcp, stable_anchor_pose)
-                        last_linear_delta = linear_delta
-                        last_rot_delta = rot_delta
-                        if linear_delta > ROBOT_LINEAR_MOVE_EPS_MM or rot_delta > ROBOT_ROT_MOVE_EPS_DEG:
-                            stable_anchor_pose = self._latest_tcp
-                            stable_since = self._last_tcp_receive_time
-                            last_linear_delta = 0.0
-                            last_rot_delta = 0.0
-                        last_seq = self._tcp_seq
+                status_age = now - self._last_robot_status_receive_time
+                fresh_status = (
+                    self._latest_robot_mode is not None and
+                    self._last_robot_status_receive_time >= started and
+                    status_age <= ROBOT_STATUS_STALE_SEC
+                )
 
-                    if stable_since is not None:
-                        stable_elapsed = max(0.0, self._last_tcp_receive_time - stable_since)
-                    if stable_since is not None and stable_elapsed >= stability_sec:
-                        return TriggerResult(
-                            True,
-                            'Robot TCP stable for '
-                            f'{stable_elapsed:.2f}s on {self.robot_tcp_topic} '
-                            f'(window delta {last_linear_delta:.2f}mm, {last_rot_delta:.2f}deg)',
-                        )
+                if fresh_status:
+                    last_mode = self._latest_robot_mode
+                    if not self._latest_robot_connected:
+                        return TriggerResult(False, f'Robot status reports disconnected on {self.robot_status_topic}')
+                    if last_mode in ROBOT_MODE_FAILURE_CODES:
+                        return TriggerResult(False, f'Robot mode {last_mode} while waiting for idle')
+                    if last_mode in ROBOT_MODE_ACTIVE_CODES:
+                        saw_active_motion = True
+                        idle_since = None
+                        idle_elapsed = 0.0
+                    elif self._latest_robot_idle:
+                        if saw_active_motion or (now - started) >= 1.0:
+                            if idle_since is None:
+                                idle_since = self._last_robot_status_receive_time
+                            idle_elapsed = max(0.0, self._last_robot_status_receive_time - idle_since)
+                            if idle_elapsed >= stability_sec:
+                                return TriggerResult(
+                                    True,
+                                    'Robot idle for '
+                                    f'{idle_elapsed:.2f}s from {self.robot_status_topic} '
+                                    f'(mode {last_mode})',
+                                )
+                        else:
+                            idle_since = None
+                            idle_elapsed = 0.0
+                    else:
+                        idle_since = None
+                        idle_elapsed = 0.0
+
                 if stop_event.is_set():
-                    return TriggerResult(False, 'Stopped while monitoring robot stability')
+                    return TriggerResult(False, 'Stopped while monitoring robot idle status')
                 if now >= deadline:
-                    if self._latest_tcp is None:
-                        return TriggerResult(False, f'No TCP feedback received on {self.robot_tcp_topic}')
-                    tcp_age = now - self._last_tcp_receive_time
-                    if tcp_age > ROBOT_TCP_STALE_SEC:
+                    if self._latest_robot_mode is None:
+                        return TriggerResult(False, f'No robot status received on {self.robot_status_topic}')
+                    if status_age > ROBOT_STATUS_STALE_SEC:
                         return TriggerResult(
                             False,
-                            f'TCP feedback stale on {self.robot_tcp_topic}: last update {tcp_age:.2f}s ago',
+                            f'Robot status stale on {self.robot_status_topic}: last update {status_age:.2f}s ago',
                         )
                     return TriggerResult(
                         False,
-                        'Robot did not become stable within '
+                        'Robot did not report idle within '
                         f'{ROBOT_MONITOR_TIMEOUT_SEC:.1f}s '
-                        f'(stable time {stable_elapsed:.2f}/{stability_sec:.2f}s, '
-                        f'window delta {last_linear_delta:.2f}mm, {last_rot_delta:.2f}deg)',
+                        f'(idle time {idle_elapsed:.2f}/{stability_sec:.2f}s, last mode {last_mode})',
                     )
-                self._tcp_condition.wait(timeout=0.1)
-        return TriggerResult(False, f'ROS shutdown while monitoring {self.robot_tcp_topic}')
+                self._robot_status_condition.wait(timeout=0.1)
+        return TriggerResult(False, f'ROS shutdown while monitoring {self.robot_status_topic}')
 
     def click_trigger(self, client_key: str, wait_response_sec: float | None = None) -> TriggerResult:
         service_name, client = self._trigger_clients[client_key]
@@ -1052,6 +1233,38 @@ class RobotCellOrchestratorNode(Node):
         )
         return TriggerResult(bool(response.started), f'{service_name}: {response.message} ({applied})')
 
+    def set_item_auto_repick(
+        self,
+        enabled: bool,
+        wait_response_sec: float = ARM_CLICK_RESPONSE_TIMEOUT_SEC,
+    ) -> TriggerResult:
+        service_name = self.item_auto_repick_service
+        client = self._item_auto_repick_client
+        if not client.service_is_ready():
+            return TriggerResult(False, f'Service unavailable: {service_name}')
+
+        request = SetBool.Request()
+        request.data = bool(enabled)
+        try:
+            future = client.call_async(request)
+        except Exception as exc:
+            return TriggerResult(False, f'Failed to set Auto Repick via {service_name}: {exc}')
+
+        deadline = time.monotonic() + max(0.0, float(wait_response_sec))
+        while rclpy.ok() and not future.done() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not future.done():
+            return TriggerResult(False, f'Timed out waiting for {service_name} response')
+
+        try:
+            response = future.result()
+        except Exception as exc:
+            return TriggerResult(False, f'{service_name} response failed: {exc}')
+
+        if response is None:
+            return TriggerResult(False, f'{service_name} returned no response')
+        return TriggerResult(bool(response.success), f'{service_name}: {response.message}')
+
     def read_seek_status(
         self,
         client_key: str,
@@ -1104,42 +1317,17 @@ class RobotCellOrchestratorNode(Node):
             return SeekStatusResult(False, False, f'{service_name} returned no response')
         return SeekStatusResult(True, bool(response.success), f'{service_name}: {response.message}')
 
-    def _tcp_callback(self, msg: ToolVectorActual) -> None:
-        tcp = (
-            float(msg.x),
-            float(msg.y),
-            float(msg.z),
-            float(msg.rx),
-            float(msg.ry),
-            float(msg.rz),
-        )
+    def _robot_status_callback(self, msg: RobotStatus) -> None:
         now = time.monotonic()
-        with self._tcp_condition:
-            self._tcp_seq += 1
-            self._latest_tcp = tcp
-            self._last_tcp_receive_time = now
-            self._tcp_condition.notify_all()
-
-    @staticmethod
-    def _pose_delta(
-        lhs: tuple[float, float, float, float, float, float],
-        rhs: tuple[float, float, float, float, float, float],
-    ) -> tuple[float, float]:
-        linear_delta = (
-            (lhs[0] - rhs[0]) ** 2 +
-            (lhs[1] - rhs[1]) ** 2 +
-            (lhs[2] - rhs[2]) ** 2
-        ) ** 0.5
-        rot_delta = max(
-            RobotCellOrchestratorNode._angle_delta_deg(lhs[3], rhs[3]),
-            RobotCellOrchestratorNode._angle_delta_deg(lhs[4], rhs[4]),
-            RobotCellOrchestratorNode._angle_delta_deg(lhs[5], rhs[5]),
-        )
-        return linear_delta, rot_delta
-
-    @staticmethod
-    def _angle_delta_deg(lhs: float, rhs: float) -> float:
-        return abs((float(lhs) - float(rhs) + 180.0) % 360.0 - 180.0)
+        mode = int(getattr(msg, 'robot_mode', ROBOT_MODE_ENABLED if bool(msg.is_enable) else -1))
+        is_idle = bool(getattr(msg, 'is_idle', False)) or mode == ROBOT_MODE_ENABLED
+        with self._robot_status_condition:
+            self._robot_status_seq += 1
+            self._latest_robot_mode = mode
+            self._latest_robot_idle = is_idle
+            self._latest_robot_connected = bool(msg.is_connected)
+            self._last_robot_status_receive_time = now
+            self._robot_status_condition.notify_all()
 
 
 class RobotCellOrchestratorGui:
@@ -1169,6 +1357,16 @@ class RobotCellOrchestratorGui:
         self._offline_step_requested = False
         self._offline_step_waiting = False
         self._offline_step_button_label = 'Next Step'
+        self.eye_on_hand_calibration_var = tk.StringVar(
+            value=self._runtime_settings.eye_on_hand_calibration_file
+        )
+        self.eye_to_hand_calibration_var = tk.StringVar(
+            value=self._runtime_settings.eye_to_hand_calibration_file
+        )
+        self.platform_calibration_var = tk.StringVar(
+            value=self._runtime_settings.platform_calibration_file
+        )
+        self._sync_calibration_selection_to_robot_ip(persist=False, log_changes=False)
         self._last_calibration_scan = self._scan_calibrations()
         self._last_runtime_scan = self._scan_runtime()
         self._last_offline_scan: OfflineTeachScan | None = None
@@ -1182,7 +1380,14 @@ class RobotCellOrchestratorGui:
         self._cell_bridge_process_group: int | None = None
         self._cell_bridge_mode: str | None = None
         self._cell_bridge_button: tk.Button | None = None
-        self._calibration_labels: dict[str, tk.Label] = {}
+        self._nomachine_process: subprocess.Popen | None = None
+        self._nomachine_process_group: int | None = None
+        self._nomachine_auto_started = False
+        self._robot_ip_entry: tk.Entry | None = None
+        self._robot_ip_save_button: tk.Button | None = None
+        self._robot_ip_reload_button: tk.Button | None = None
+        self._calibration_buttons: dict[str, tk.Button] = {}
+        self._calibration_clear_buttons: dict[str, tk.Button] = {}
         self._service_labels: dict[str, tk.Label] = {}
         self._teach_options: dict[str, list[Path]] = {}
         self._teach_buttons: dict[str, tk.Button] = {}
@@ -1193,6 +1398,7 @@ class RobotCellOrchestratorGui:
         self._camera_window: tk.Toplevel | None = None
         self._camera_viewer_frame: tk.Frame | None = None
         self._view_cameras_button: tk.Button | None = None
+        self._right_scroll_canvas: tk.Canvas | None = None
         self._camera_viewer_visible = False
         self._camera_canvases: dict[str, tk.Canvas] = {}
         self._camera_image_refs: dict[str, tk.PhotoImage] = {}
@@ -1201,13 +1407,14 @@ class RobotCellOrchestratorGui:
         self.status_var = tk.StringVar(value='Idle')
         self.robot_status_var = tk.StringVar(value=ROBOT_STATUS_LABELS[self._robot_status])
         self.mode_var = tk.StringVar(value='Offline')
+        self.robot_ip_var = tk.StringVar(value=self._station_robot_ip_or_default())
         self.calibration_status_var = tk.StringVar(value='Calibration: scanning...')
         self.teach_status_var = tk.StringVar(value='Teach files: scanning...')
         self.runtime_status_var = tk.StringVar(value='Runtime: scanning...')
         self.service_status_var = tk.StringVar(value='Services: scanning...')
         self.node_launcher_headless_var = tk.BooleanVar(value=False)
         self.loop_var = tk.BooleanVar(value=self._runtime_settings.loop_enabled)
-        self.auto_repick_var = tk.BooleanVar(value=False)
+        self.auto_repick_var = tk.BooleanVar(value=self._runtime_settings.auto_repick_enabled)
         self.step_mode_var = tk.BooleanVar(value=self._runtime_settings.step_mode_enabled)
         self.tray_seek_stability_sec_var = tk.DoubleVar(value=self._runtime_settings.tray_seek_stability_sec)
         self.tray_intercept_x_var = tk.DoubleVar(value=self._runtime_settings.tray_intercept_x_offset_mm)
@@ -1232,6 +1439,60 @@ class RobotCellOrchestratorGui:
         self.root.after(CAMERA_VIEW_REFRESH_MS, self._periodic_camera_view_refresh)
         self.root.after(READINESS_SCAN_MS, self._periodic_readiness_scan)
         self.root.after(PROCESS_SCAN_MS, self._periodic_process_scan)
+        self.root.after(500, self._ensure_nomachine_remote_access)
+
+    def _make_scrollable_side_panel(self, parent: tk.Widget) -> tuple[tk.Frame, tk.Frame]:
+        container = tk.Frame(parent)
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(container, highlightthickness=0, borderwidth=0)
+        scrollbar = tk.Scrollbar(container, orient=tk.VERTICAL, command=canvas.yview)
+        content = tk.Frame(canvas)
+        window_id = canvas.create_window((0, 0), window=content, anchor='nw')
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky='nsew')
+        scrollbar.grid(row=0, column=1, sticky='ns')
+        self._right_scroll_canvas = canvas
+
+        def refresh_scroll_region(_event: tk.Event | None = None) -> None:
+            canvas.configure(scrollregion=canvas.bbox('all'))
+
+        def match_content_width(event: tk.Event) -> None:
+            canvas.itemconfigure(window_id, width=max(1, int(event.width)))
+
+        def scroll_units(event: tk.Event) -> int:
+            if getattr(event, 'num', None) == 4:
+                return -3
+            if getattr(event, 'num', None) == 5:
+                return 3
+            delta = getattr(event, 'delta', 0)
+            return int(-1 * (delta / 120)) if delta else 0
+
+        def on_mousewheel(event: tk.Event) -> None:
+            units = scroll_units(event)
+            if units:
+                canvas.yview_scroll(units, 'units')
+
+        def bind_wheel(_event: tk.Event) -> None:
+            canvas.bind_all('<MouseWheel>', on_mousewheel)
+            canvas.bind_all('<Button-4>', on_mousewheel)
+            canvas.bind_all('<Button-5>', on_mousewheel)
+
+        def unbind_wheel(_event: tk.Event) -> None:
+            canvas.unbind_all('<MouseWheel>')
+            canvas.unbind_all('<Button-4>')
+            canvas.unbind_all('<Button-5>')
+
+        content.bind('<Configure>', refresh_scroll_region)
+        canvas.bind('<Configure>', match_content_width)
+        container.bind('<Enter>', bind_wheel)
+        container.bind('<Leave>', unbind_wheel)
+        canvas.bind('<Enter>', bind_wheel)
+        canvas.bind('<Leave>', unbind_wheel)
+        content.bind('<Enter>', bind_wheel)
+        content.bind('<Leave>', unbind_wheel)
+        return container, content
 
     @property
     def runtime_dir(self) -> Path:
@@ -1243,27 +1504,27 @@ class RobotCellOrchestratorGui:
 
     @property
     def item_teach_dir(self) -> Path:
-        return workspace_path('teach', 'item_teach')
+        return workspace_path('teach', 'item_teach_yolo')
 
     @property
     def tray_teach_dir(self) -> Path:
-        return workspace_path('teach', 'tray_teach')
+        return workspace_path('teach', 'tray_teach_yolo')
 
     @property
     def item_detect_runtime_settings_file(self) -> Path:
-        return workspace_path('config', 'item_perception', 'item_detect_runtime_settings.yaml')
+        return workspace_path('config', 'item_perception_yolo', 'item_detect_yolo_runtime_settings.yaml')
 
     @property
     def tray_detect_runtime_settings_file(self) -> Path:
-        return workspace_path('config', 'tray_perception', 'tray_detect_runtime_settings.yaml')
+        return workspace_path('config', 'tray_perception_yolo', 'tray_detect_yolo_runtime_settings.yaml')
 
     @property
     def item_selected_profile_export_file(self) -> Path:
-        return workspace_path('config', 'item_perception', 'item_detect_selected_profile.txt')
+        return workspace_path('config', 'item_perception_yolo', 'item_detect_yolo_selected_profile.txt')
 
     @property
     def item_pick_runtime_settings_file(self) -> Path:
-        return workspace_path('config', 'item_perception', 'item_pick_runtime_settings.json')
+        return workspace_path('config', 'item_pick', 'item_pick_runtime_settings.json')
 
     @property
     def tray_intercept_runtime_settings_file(self) -> Path:
@@ -1277,6 +1538,103 @@ class RobotCellOrchestratorGui:
     def station_config_file(self) -> Path:
         return workspace_path('station_config')
 
+    def _station_robot_ip(self) -> str:
+        return key_value_config(self.station_config_file).get(ROBOT_IP_CONFIG_KEY, '').strip()
+
+    def _station_robot_ip_or_default(self) -> str:
+        return self._station_robot_ip() or ROBOT_LAN2_DEFAULT_IP
+
+    def _reload_robot_ip_clicked(self) -> None:
+        self.robot_ip_var.set(self._station_robot_ip_or_default())
+        self._log(f'Reloaded robot IP from station_config: {self.robot_ip_var.get().strip()}')
+        self._sync_calibration_selection_to_robot_ip(persist=True, log_changes=True)
+
+    def _save_robot_ip_clicked(self) -> None:
+        if self._running:
+            messagebox.showwarning(
+                'Cycle Running',
+                'Stop the current cycle before changing the robot IP address.',
+                parent=self.root,
+            )
+            return
+
+        raw_ip = self.robot_ip_var.get().strip()
+        normalized_ip = normalize_ipv4_address(raw_ip)
+        if normalized_ip is None:
+            messagebox.showerror(
+                'Invalid Robot IP',
+                f'Enter a valid IPv4 address for {ROBOT_IP_CONFIG_KEY}.',
+                parent=self.root,
+            )
+            self._log(f'Invalid robot IP rejected: {raw_ip!r}')
+            return
+
+        previous_ip = self._station_robot_ip()
+        try:
+            update_key_value_config(self.station_config_file, ROBOT_IP_CONFIG_KEY, normalized_ip)
+        except Exception as exc:
+            messagebox.showerror(
+                'Robot IP Save Failed',
+                f'Could not update {self.station_config_file}: {exc}',
+                parent=self.root,
+            )
+            self._log(f'Failed to save robot IP {normalized_ip}: {exc}')
+            return
+
+        self.robot_ip_var.set(normalized_ip)
+        self._log(f'Saved robot IP: {previous_ip or "unset"} -> {normalized_ip}')
+        self._sync_calibration_selection_to_robot_ip(persist=True, log_changes=True)
+        if self._launch_processes.get('robot_bringup') is not None:
+            messagebox.showinfo(
+                'Restart Robot Bringup',
+                'Robot IP saved. Stop and relaunch Robot Bringup to connect to the new controller IP.',
+                parent=self.root,
+            )
+
+    def _sync_calibration_selection_to_robot_ip(self, *, persist: bool, log_changes: bool) -> None:
+        robot_ip = self._station_robot_ip_or_default()
+        updates: list[str] = []
+        missing: list[str] = []
+        was_suspended = getattr(self, '_suspend_runtime_settings_events', False)
+        self._suspend_runtime_settings_events = True
+        try:
+            for kind in CALIBRATION_PATTERNS:
+                latest = self._latest_calibration_path_for_robot(kind)
+                variable = self._calibration_variable(kind)
+                next_value = str(latest) if latest is not None else ''
+                previous_value = variable.get().strip()
+                if previous_value != next_value:
+                    variable.set(next_value)
+                    updates.append(f'{kind}={latest.name}' if latest is not None else f'{kind}=missing')
+                if latest is None:
+                    missing.append(kind)
+        finally:
+            self._suspend_runtime_settings_events = was_suspended
+
+        self._last_calibration_scan = self._scan_calibrations()
+        if getattr(self, '_calibration_buttons', {}):
+            self._refresh_calibration_button_texts()
+        if hasattr(self, 'calibration_status_var'):
+            if hasattr(self, '_last_runtime_scan'):
+                self._refresh_status_views()
+            else:
+                self.calibration_status_var.set(self._last_calibration_scan.message)
+        if log_changes and updates:
+            self._log(f'Robot {robot_ip} calibration selection: {", ".join(updates)}')
+        if log_changes and missing:
+            self._log(f'Robot {robot_ip} missing calibration file(s): {", ".join(missing)}')
+        if persist:
+            self._flush_robot_cell_orchestrator_runtime_settings()
+
+    def _refresh_robot_ip_controls(self) -> None:
+        setting_state = tk.DISABLED if self._running else tk.NORMAL
+        if self._robot_ip_entry is not None:
+            self._robot_ip_entry.configure(state=setting_state)
+        if self._robot_ip_save_button is not None:
+            self._robot_ip_save_button.configure(state=setting_state)
+        if self._robot_ip_reload_button is not None:
+            self._robot_ip_reload_button.configure(state=setting_state)
+
     @property
     def cell_bridge_source_dir(self) -> Path:
         return workspace_path('cell_external_bridge', 'src')
@@ -1288,15 +1646,23 @@ class RobotCellOrchestratorGui:
     def _load_robot_cell_orchestrator_runtime_settings(self) -> RobotCellOrchestratorRuntimeSettings:
         defaults = RobotCellOrchestratorRuntimeSettings(
             loop_enabled=False,
+            auto_repick_enabled=True,
             step_mode_enabled=False,
             tray_seek_stability_sec=ROBOT_STABILITY_SEC_DEFAULT,
             tray_intercept_x_offset_mm=0.0,
             tray_intercept_y_offset_mm=0.0,
             tray_ee_angle_deg=0.0,
+            eye_on_hand_calibration_file='',
+            eye_to_hand_calibration_file='',
+            platform_calibration_file='',
         )
         payload = _load_yaml_mapping(workspace_path('config', 'robot_cell_orchestrator', 'robot_cell_orchestrator_runtime_settings.yaml')) or {}
         return RobotCellOrchestratorRuntimeSettings(
             loop_enabled=defaults.loop_enabled,
+            auto_repick_enabled=_coerce_bool(
+                payload.get('auto_repick_enabled'),
+                defaults.auto_repick_enabled,
+            ),
             step_mode_enabled=_coerce_bool(payload.get('step_mode_enabled'), defaults.step_mode_enabled),
             tray_seek_stability_sec=_coerce_float(
                 payload.get('tray_seek_stability_sec'),
@@ -1322,6 +1688,15 @@ class RobotCellOrchestratorGui:
                 TRAY_EE_ANGLE_MIN_DEG,
                 TRAY_EE_ANGLE_MAX_DEG,
             ),
+            eye_on_hand_calibration_file=str(
+                payload.get('eye_on_hand_calibration_file', defaults.eye_on_hand_calibration_file) or ''
+            ).strip(),
+            eye_to_hand_calibration_file=str(
+                payload.get('eye_to_hand_calibration_file', defaults.eye_to_hand_calibration_file) or ''
+            ).strip(),
+            platform_calibration_file=str(
+                payload.get('platform_calibration_file', defaults.platform_calibration_file) or ''
+            ).strip(),
             window_geometry=_normalize_window_geometry(payload.get('window_geometry'), defaults.window_geometry),
         )
 
@@ -1342,11 +1717,15 @@ class RobotCellOrchestratorGui:
             self._suspend_runtime_settings_events = was_suspended
         payload = {
             'schema_version': 1,
+            'auto_repick_enabled': settings.auto_repick_enabled,
             'step_mode_enabled': settings.step_mode_enabled,
             'tray_seek_stability_sec': settings.tray_seek_stability_sec,
             'tray_intercept_x_offset_mm': settings.tray_intercept_x_offset_mm,
             'tray_intercept_y_offset_mm': settings.tray_intercept_y_offset_mm,
             'tray_ee_angle_deg': settings.tray_ee_angle_deg,
+            'eye_on_hand_calibration_file': settings.eye_on_hand_calibration_file,
+            'eye_to_hand_calibration_file': settings.eye_to_hand_calibration_file,
+            'platform_calibration_file': settings.platform_calibration_file,
             'window_geometry': settings.window_geometry,
         }
         path = self.robot_cell_orchestrator_runtime_settings_file
@@ -1394,6 +1773,23 @@ class RobotCellOrchestratorGui:
             return
         self._schedule_robot_cell_orchestrator_runtime_settings_save()
 
+    def _auto_repick_changed(self) -> None:
+        if self._suspend_runtime_settings_events:
+            return
+        self._schedule_robot_cell_orchestrator_runtime_settings_save()
+        enabled = bool(self.auto_repick_var.get())
+
+        def worker() -> None:
+            result = self.node.set_item_auto_repick(enabled)
+            state = 'ON' if enabled else 'OFF'
+            if result.success:
+                self._log(f'Auto Repick {state}: {result.message}')
+            else:
+                self._log(f'Auto Repick {state}: FAIL - {result.message}')
+                self._set_status(f'Auto Repick update failed: {result.message}')
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _on_window_configure(self, event: tk.Event) -> None:
         if self._suspend_runtime_settings_events:
             return
@@ -1434,33 +1830,91 @@ class RobotCellOrchestratorGui:
         return [f'selected_profile_path:={profile_path}']
 
     def _build_launch_specs(self) -> None:
-        offline_bin = lambda mode, headless: [f'bin_teach_dir:={self.bin_teach_dir}', f'output_dir:={self.bin_teach_dir}']
-        offline_item_teach = lambda mode, headless: [f'profiles_dir:={self.item_teach_dir}', f'bin_teach_dir:={self.bin_teach_dir}']
-        offline_tray_teach = lambda mode, headless: [f'profiles_dir:={self.tray_teach_dir}']
+        def selected_calibration_arg(kind: str, argument_name: str = 'calibration_file') -> list[str]:
+            path = self._selected_calibration_path(kind)
+            return [f'{argument_name}:={path}'] if path is not None else []
+
+        def offline_bin(mode: str, headless: bool) -> list[str]:
+            args = [
+                f'output_dir:={self.bin_teach_dir}',
+            ]
+            args.extend(selected_calibration_arg(CALIBRATION_EYE_TO_HAND))
+            args.extend(selected_calibration_arg(CALIBRATION_PLATFORM, 'platform_calibration_file'))
+            if headless:
+                args.append('headless:=true')
+            return args
+
+        def offline_item_teach(mode: str, headless: bool) -> list[str]:
+            args = [
+                f'profile_dir:={self.item_teach_dir}',
+                f'model_root:={self.item_teach_dir}',
+                f'bin_teach_dir:={self.bin_teach_dir}',
+            ]
+            args.extend(selected_calibration_arg(CALIBRATION_EYE_TO_HAND))
+            args.extend(selected_calibration_arg(CALIBRATION_PLATFORM, 'platform_calibration_file'))
+            return args
+
+        def offline_tray_teach(mode: str, headless: bool) -> list[str]:
+            args = [
+                f'profile_dir:={self.tray_teach_dir}',
+                f'model_root:={self.tray_teach_dir}',
+                f'bin_teach_dir:={self.bin_teach_dir}',
+            ]
+            args.extend(selected_calibration_arg(CALIBRATION_EYE_ON_HAND))
+            return args
 
         def item_detect(mode: str, headless: bool) -> list[str]:
-            args = [f'profiles_dir:={self.runtime_dir if mode == MODE_ONLINE else self.item_teach_dir}']
-            args.extend(self._selected_detect_profile_launch_args(TEACH_KIND_ITEM, mode))
+            profiles_dir = self.runtime_dir if mode == MODE_ONLINE else self.item_teach_dir
+            args = [
+                f'profiles_dir:={profiles_dir}',
+                f'model_root:={profiles_dir}',
+                f'runtime_settings_file:={self.item_detect_runtime_settings_file}',
+                f'selected_profile_export_file:={self.item_selected_profile_export_file}',
+            ]
+            args.extend(selected_calibration_arg(CALIBRATION_EYE_TO_HAND))
+            args.extend(selected_calibration_arg(CALIBRATION_PLATFORM, 'platform_calibration_file'))
             if headless:
                 args.append('headless:=true')
             return args
 
         def tray_detect(mode: str, headless: bool) -> list[str]:
-            args = [f'profiles_dir:={self.runtime_dir if mode == MODE_ONLINE else self.tray_teach_dir}']
+            profiles_dir = self.runtime_dir if mode == MODE_ONLINE else self.tray_teach_dir
+            args = [
+                f'profiles_dir:={profiles_dir}',
+                f'model_root:={profiles_dir}',
+                f'runtime_settings_file:={self.tray_detect_runtime_settings_file}',
+            ]
             args.extend(self._selected_detect_profile_launch_args(TEACH_KIND_TRAY, mode))
+            args.extend(selected_calibration_arg(CALIBRATION_EYE_ON_HAND))
             if headless:
                 args.append('headless:=true')
             return args
 
+        def platform_calibration(mode: str, headless: bool) -> list[str]:
+            return selected_calibration_arg(CALIBRATION_EYE_TO_HAND)
+
         def item_pick(mode: str, headless: bool) -> list[str]:
+            args = [
+                'camera_safety_frame_id:=arm_calibrated_camera_link',
+            ]
+            args.extend(selected_calibration_arg(
+                CALIBRATION_EYE_TO_HAND,
+                'calibration_file',
+            ))
+            args.extend(selected_calibration_arg(
+                CALIBRATION_EYE_ON_HAND,
+                'camera_safety_calibration_file',
+            ))
+            args.extend(selected_calibration_arg(CALIBRATION_PLATFORM, 'platform_calibration_file'))
             if not headless:
-                return []
-            return [
+                return args
+            args.extend([
                 'headless:=true',
                 'load_runtime_settings:=true',
                 f'runtime_settings_file:={self.item_pick_runtime_settings_file}',
                 f'item_profile_state_file:={self.item_selected_profile_export_file}',
-            ]
+            ])
+            return args
 
         def tray_intercept(mode: str, headless: bool) -> list[str]:
             if not headless:
@@ -1492,27 +1946,45 @@ class RobotCellOrchestratorGui:
                 'Camera Calibrate',
                 'camera_calibration',
                 'camera_calibration.launch.py',
-                lambda mode, headless: [],
-                ('Eye-on-hand', 'Eye-to-hand'),
+                lambda mode, headless: ['calibration_mode:=eye_on_hand'],
+                None,
                 source_python_venv=False,
             ),
-            'platform_teach': LaunchSpec(
-                'Platform Teach',
-                'camera_calibration',
-                'platform_teach.launch.py',
-                lambda mode, headless: [],
-                'Platform',
+            'platform_calibration': LaunchSpec(
+                'Platform Calibration',
+                'platform_calibration',
+                'platform_calibration.launch.py',
+                platform_calibration,
+                CALIBRATION_EYE_TO_HAND,
             ),
-            'bin_teach': LaunchSpec('Bin Teach', 'item_perception', 'bin_teach.launch.py', offline_bin, 'Platform'),
-            'tray_teach': LaunchSpec('Tray Teach', 'tray_perception', 'tray_teach.launch.py', offline_tray_teach, None),
-            'item_teach': LaunchSpec('Item Teach', 'item_perception', 'item_teach.launch.py', offline_item_teach, 'Eye-on-hand'),
+            'bin_teach': LaunchSpec(
+                'Bin Teach',
+                'item_perception_yolo',
+                'bin_teach_yolo.launch.py',
+                offline_bin,
+                (CALIBRATION_EYE_TO_HAND, CALIBRATION_PLATFORM),
+            ),
+            'tray_teach': LaunchSpec(
+                'Tray Teach',
+                'tray_perception_yolo',
+                'tray_teach_yolo.launch.py',
+                offline_tray_teach,
+                CALIBRATION_EYE_ON_HAND,
+            ),
+            'item_teach': LaunchSpec(
+                'Item Teach',
+                'item_perception_yolo',
+                'item_teach_yolo.launch.py',
+                offline_item_teach,
+                (CALIBRATION_EYE_TO_HAND, CALIBRATION_PLATFORM),
+            ),
             'item_pick': LaunchSpec('Item Pick', 'item_pick', 'item_pick.launch.py', item_pick, headless_label='Item Pick Headless'),
             'item_detect': LaunchSpec(
                 'Item Detect',
-                'item_perception',
-                'item_detect.launch.py',
+                'item_perception_yolo',
+                'item_detect_yolo.launch.py',
                 item_detect,
-                'Eye-on-hand',
+                (CALIBRATION_EYE_TO_HAND, CALIBRATION_PLATFORM),
                 headless_label='Item Detect Headless',
             ),
             'tray_intercept': LaunchSpec(
@@ -1524,10 +1996,10 @@ class RobotCellOrchestratorGui:
             ),
             'tray_detect': LaunchSpec(
                 'Tray Detect',
-                'tray_perception',
-                'tray_detect.launch.py',
+                'tray_perception_yolo',
+                'tray_detect_yolo.launch.py',
                 tray_detect,
-                'Eye-on-hand',
+                CALIBRATION_EYE_ON_HAND,
                 headless_label='Tray Detect Headless',
             ),
         }
@@ -1575,7 +2047,12 @@ class RobotCellOrchestratorGui:
 
         self.loop_check = tk.Checkbutton(controls, text='Loop after successful cycle', variable=self.loop_var)
         self.loop_check.grid(row=1, column=0, columnspan=2, sticky='w', pady=(10, 0))
-        self.auto_repick_check = tk.Checkbutton(controls, text='Auto Repick', variable=self.auto_repick_var)
+        self.auto_repick_check = tk.Checkbutton(
+            controls,
+            text='Auto Repick',
+            variable=self.auto_repick_var,
+            command=self._auto_repick_changed,
+        )
         self.auto_repick_check.grid(row=2, column=0, sticky='w', pady=(8, 0))
         self.step_mode_check = tk.Checkbutton(
             controls,
@@ -1681,12 +2158,40 @@ class RobotCellOrchestratorGui:
         self.log_text = scrolledtext.ScrolledText(log_frame, height=12, state=tk.DISABLED)
         self.log_text.grid(row=0, column=0, sticky='nsew')
 
-        right = tk.Frame(outer)
-        right.grid(row=0, column=1, rowspan=5, sticky='nsew')
+        right_container, right = self._make_scrollable_side_panel(outer)
+        right_container.grid(row=0, column=1, rowspan=5, sticky='nsew')
         right.columnconfigure(0, weight=1)
 
+        station_frame = tk.LabelFrame(right, text='Robot Connection', padx=10, pady=8)
+        station_frame.grid(row=0, column=0, sticky='ew')
+        station_frame.columnconfigure(1, weight=1)
+        tk.Label(station_frame, text='Robot IP').grid(row=0, column=0, sticky='w')
+        self._robot_ip_entry = tk.Entry(station_frame, textvariable=self.robot_ip_var, width=16)
+        self._robot_ip_entry.grid(row=0, column=1, sticky='ew', padx=(8, 6))
+        self._robot_ip_entry.bind('<Return>', lambda _event: self._save_robot_ip_clicked())
+        self._robot_ip_save_button = tk.Button(
+            station_frame,
+            text='Save',
+            command=self._save_robot_ip_clicked,
+            width=7,
+        )
+        self._robot_ip_save_button.grid(row=0, column=2, sticky='ew', padx=(0, 4))
+        self._robot_ip_reload_button = tk.Button(
+            station_frame,
+            text='Reload',
+            command=self._reload_robot_ip_clicked,
+            width=7,
+        )
+        self._robot_ip_reload_button.grid(row=0, column=3, sticky='ew')
+        tk.Label(
+            station_frame,
+            text=f'LAN2 default: {ROBOT_LAN2_DEFAULT_IP}',
+            anchor='w',
+            fg='#4a4a4a',
+        ).grid(row=1, column=0, columnspan=4, sticky='ew', pady=(4, 0))
+
         dropdown_frame = tk.LabelFrame(right, text='Offline Teach Selection', padx=10, pady=8)
-        dropdown_frame.grid(row=0, column=0, sticky='ew')
+        dropdown_frame.grid(row=1, column=0, sticky='ew', pady=(10, 0))
         dropdown_frame.columnconfigure(1, weight=1)
         dropdown_frame.columnconfigure(2, weight=0)
         self._make_teach_picker_button(dropdown_frame, 'Bin', TEACH_KIND_BIN, self.bin_teach_var, self.bin_teach_dir, 0)
@@ -1694,16 +2199,30 @@ class RobotCellOrchestratorGui:
         self._make_teach_picker_button(dropdown_frame, 'Tray', TEACH_KIND_TRAY, self.tray_teach_var, self.tray_teach_dir, 2)
 
         calibration_frame = tk.LabelFrame(right, text='Calibration Files', padx=10, pady=8)
-        calibration_frame.grid(row=1, column=0, sticky='ew', pady=(10, 0))
+        calibration_frame.grid(row=2, column=0, sticky='ew', pady=(10, 0))
         calibration_frame.columnconfigure(1, weight=1)
-        for row, key in enumerate(CALIBRATION_PATTERNS):
-            tk.Label(calibration_frame, text=key).grid(row=row, column=0, sticky='w')
-            label = tk.Label(calibration_frame, text='Scanning', anchor='w')
-            label.grid(row=row, column=1, sticky='ew', padx=(8, 0))
-            self._calibration_labels[key] = label
+        calibration_frame.columnconfigure(2, weight=0)
+        self._make_calibration_picker_button(
+            calibration_frame,
+            CALIBRATION_EYE_ON_HAND,
+            self.eye_on_hand_calibration_var,
+            0,
+        )
+        self._make_calibration_picker_button(
+            calibration_frame,
+            CALIBRATION_EYE_TO_HAND,
+            self.eye_to_hand_calibration_var,
+            1,
+        )
+        self._make_calibration_picker_button(
+            calibration_frame,
+            CALIBRATION_PLATFORM,
+            self.platform_calibration_var,
+            2,
+        )
 
         bridge_frame = tk.LabelFrame(right, text='External Bridge', padx=10, pady=8)
-        bridge_frame.grid(row=2, column=0, sticky='ew', pady=(10, 0))
+        bridge_frame.grid(row=3, column=0, sticky='ew', pady=(10, 0))
         bridge_frame.columnconfigure(0, weight=1)
         self._cell_bridge_button = tk.Button(
             bridge_frame,
@@ -1714,7 +2233,7 @@ class RobotCellOrchestratorGui:
         self._cell_bridge_button.grid(row=0, column=0, sticky='ew')
 
         launch_frame = tk.LabelFrame(right, text='Node Launcher', padx=10, pady=8)
-        launch_frame.grid(row=3, column=0, sticky='ew', pady=(10, 0))
+        launch_frame.grid(row=4, column=0, sticky='ew', pady=(10, 0))
         launch_frame.columnconfigure(0, weight=1)
         self._node_launcher_headless_button = tk.Checkbutton(
             launch_frame,
@@ -1736,11 +2255,11 @@ class RobotCellOrchestratorGui:
             self._launch_buttons[key] = button
 
         camera_button_frame = tk.LabelFrame(right, text='Camera Views', padx=10, pady=8)
-        camera_button_frame.grid(row=4, column=0, sticky='ew', pady=(10, 0))
+        camera_button_frame.grid(row=5, column=0, sticky='ew', pady=(10, 0))
         camera_button_frame.columnconfigure(0, weight=1)
         self._view_cameras_button = tk.Button(
             camera_button_frame,
-            text='View Cameras',
+            text='Open Camera Window',
             command=self._view_cameras_clicked,
             width=24,
         )
@@ -1779,7 +2298,9 @@ class RobotCellOrchestratorGui:
 
     def _view_cameras_clicked(self) -> None:
         if self._camera_window is not None and self._camera_window.winfo_exists():
-            self._close_camera_window()
+            self._camera_window.deiconify()
+            self._camera_window.lift()
+            self._camera_window.focus_set()
             return
 
         window = tk.Toplevel(self.root)
@@ -1793,7 +2314,7 @@ class RobotCellOrchestratorGui:
         self._camera_viewer_visible = True
         if self._view_cameras_button is not None:
             self._view_cameras_button.configure(
-                text='Close Cameras',
+                text='Show Camera Window',
                 state=tk.NORMAL,
                 bg=RUNNING_BUTTON_BG,
                 activebackground=RUNNING_BUTTON_BG,
@@ -1811,7 +2332,7 @@ class RobotCellOrchestratorGui:
         self._camera_rendered_views.clear()
         if self._view_cameras_button is not None:
             self._view_cameras_button.configure(
-                text='View Cameras',
+                text='Open Camera Window',
                 state=tk.NORMAL,
                 bg=self.root.cget('bg'),
                 activebackground=self.root.cget('bg'),
@@ -1911,6 +2432,164 @@ class RobotCellOrchestratorGui:
         self._teach_delete_buttons[kind] = delete_button
         return button
 
+    def _make_calibration_picker_button(
+        self,
+        parent: tk.Widget,
+        kind: str,
+        variable: tk.StringVar,
+        row: int,
+    ) -> tk.Button:
+        pady = (0 if row == 0 else 6, 0)
+        tk.Label(parent, text=kind).grid(row=row, column=0, sticky='w', pady=pady)
+        button = tk.Button(
+            parent,
+            text='Select file',
+            command=lambda: self._select_calibration_file(kind, variable),
+            anchor='w',
+            width=26,
+        )
+        button.grid(row=row, column=1, sticky='ew', padx=(8, 0), pady=pady)
+        clear_button = tk.Button(
+            parent,
+            text='Clear',
+            command=lambda: self._clear_calibration_file(kind, variable),
+            width=8,
+        )
+        clear_button.grid(row=row, column=2, sticky='ew', padx=(6, 0), pady=pady)
+        variable.trace_add('write', lambda *_args: self._calibration_selection_changed())
+        self._calibration_buttons[kind] = button
+        self._calibration_clear_buttons[kind] = clear_button
+        return button
+
+    def _calibration_variable(self, kind: str) -> tk.StringVar:
+        return {
+            CALIBRATION_EYE_ON_HAND: self.eye_on_hand_calibration_var,
+            CALIBRATION_EYE_TO_HAND: self.eye_to_hand_calibration_var,
+            CALIBRATION_PLATFORM: self.platform_calibration_var,
+        }[kind]
+
+    def _latest_calibration_path_for_robot(self, kind: str) -> Path | None:
+        robot_ip = self._station_robot_ip_or_default()
+        pattern = CALIBRATION_PATTERNS.get(kind, '*.yaml')
+        calibration_dir = workspace_path('calibration')
+        if not robot_ip or not calibration_dir.exists():
+            return None
+        candidates = [
+            path
+            for path in calibration_dir.glob(pattern)
+            if path.is_file()
+            and path.stat().st_size > 0
+            and classify_calibration_yaml(path) == kind
+            and calibration_path_matches_robot_ip(path, robot_ip)
+        ]
+        return max(candidates, key=lambda path: path.stat().st_mtime).resolve() if candidates else None
+
+    def _resolve_calibration_path(
+        self,
+        kind: str,
+        raw_value: str,
+        *,
+        require_current_robot_ip: bool = False,
+    ) -> Path | None:
+        selected = str(raw_value or '').strip()
+        if not selected:
+            return None
+        path = Path(selected).expanduser()
+        if not path.is_absolute():
+            path = workspace_root() / path
+        if not path.exists() or not path.is_file() or path.stat().st_size <= 0:
+            return None
+        if classify_calibration_yaml(path) != kind:
+            return None
+        resolved = path.resolve()
+        if require_current_robot_ip and not calibration_path_matches_robot_ip(
+            resolved,
+            self._station_robot_ip_or_default(),
+        ):
+            return None
+        return resolved
+
+    def _selected_calibration_path(self, kind: str) -> Path | None:
+        variable = self._calibration_variable(kind)
+        selected = self._resolve_calibration_path(
+            kind,
+            variable.get(),
+            require_current_robot_ip=True,
+        )
+        if selected is not None:
+            return selected
+        return self._latest_calibration_path_for_robot(kind)
+
+    def _select_calibration_file(self, kind: str, variable: tk.StringVar) -> None:
+        current = self._resolve_calibration_path(kind, variable.get())
+        initial_dir = current.parent if current is not None else workspace_path('calibration')
+        initial_dir.mkdir(parents=True, exist_ok=True)
+        pattern = CALIBRATION_PATTERNS.get(kind, '*.yaml')
+        expected_label = f'{kind} calibration ({pattern})'
+        selected = filedialog.askopenfilename(
+            parent=self.root,
+            title=f'Select {kind} calibration file',
+            initialdir=str(initial_dir),
+            filetypes=((expected_label, pattern),),
+        )
+        if not selected:
+            return
+
+        path = Path(selected).expanduser()
+        actual_kind = classify_calibration_yaml(path)
+        if actual_kind != kind:
+            self._log(
+                f'Calibration file {path.name} is {actual_kind}, expected {kind}. '
+                'Select a calibration YAML with matching calibration_type metadata.'
+            )
+            messagebox.showerror(
+                'Wrong Calibration Type',
+                f'{path.name} is {actual_kind}; expected {kind}.',
+                parent=self.root,
+            )
+            return
+        if not calibration_path_matches_robot_ip(path, self._station_robot_ip_or_default()):
+            current_ip = self._station_robot_ip_or_default()
+            self._log(
+                f'Calibration file {path.name} does not match current robot IP {current_ip}.'
+            )
+            messagebox.showerror(
+                'Wrong Robot Calibration',
+                f'{path.name} is not tagged for current robot IP {current_ip}.',
+                parent=self.root,
+            )
+            return
+
+        variable.set(str(path.resolve()))
+        self._log(f'Selected {kind} calibration: {path.name}')
+
+    def _clear_calibration_file(self, kind: str, variable: tk.StringVar) -> None:
+        variable.set('')
+        self._log(f'Cleared {kind} calibration selection')
+
+    def _calibration_selection_changed(self) -> None:
+        if self._suspend_runtime_settings_events:
+            return
+        self._last_calibration_scan = self._scan_calibrations()
+        self._refresh_calibration_button_texts()
+        self._schedule_robot_cell_orchestrator_runtime_settings_save()
+        if hasattr(self, 'calibration_status_var'):
+            self._refresh_status_views()
+
+    def _refresh_calibration_button_texts(self) -> None:
+        for kind, button in self._calibration_buttons.items():
+            selected = self._selected_calibration_path(kind)
+            button.configure(
+                text=selected.name if selected is not None else 'Select file',
+                fg='#1b7f3a' if selected is not None else '#b00020',
+                state=tk.DISABLED if self._running else tk.NORMAL,
+            )
+            clear_button = self._calibration_clear_buttons.get(kind)
+            if clear_button is not None:
+                clear_button.configure(
+                    state=tk.NORMAL if selected is not None and not self._running else tk.DISABLED
+                )
+
     def _set_mode(self, mode: str) -> None:
         if mode not in (MODE_OFFLINE, MODE_ONLINE):
             return
@@ -1926,10 +2605,9 @@ class RobotCellOrchestratorGui:
         self._log(f'Mode set to {self.mode_var.get()}')
 
     def _scan_calibrations(self) -> CalibrationScan:
-        calibration_dir = workspace_path('calibration')
         return CalibrationScan({
-            key: latest_file(calibration_dir, pattern)
-            for key, pattern in CALIBRATION_PATTERNS.items()
+            kind: self._selected_calibration_path(kind)
+            for kind in CALIBRATION_PATTERNS
         })
 
     def _scan_runtime(self) -> RuntimeScan:
@@ -2108,10 +2786,21 @@ class RobotCellOrchestratorGui:
         raw_name: str,
         expected_kind: str,
         label: str,
+        *,
+        recursive: bool = False,
     ) -> tuple[Path | None, str | None]:
         if not self._is_safe_yaml_filename(raw_name):
             return None, f'{label} filename must be a local .yaml/.yml basename: {raw_name!r}'
         path = directory / raw_name
+        if recursive and (not path.exists() or not path.is_file()):
+            matches = [
+                candidate for candidate in directory.rglob(raw_name)
+                if candidate.is_file() and candidate.suffix.lower() in ('.yaml', '.yml')
+            ]
+            if len(matches) == 1:
+                path = matches[0]
+            elif len(matches) > 1:
+                return None, f'{label} teach file {raw_name!r} is ambiguous under {directory}'
         if not path.exists() or not path.is_file():
             return None, f'{label} teach file not found: {path}'
         kind = classify_teach_yaml(path)
@@ -2291,12 +2980,8 @@ class RobotCellOrchestratorGui:
                 activebackground=RUNNING_BUTTON_BG if self._node_launcher_headless_enabled() else self.root.cget('bg'),
             )
 
-        for key, label in self._calibration_labels.items():
-            path = self._last_calibration_scan.files.get(key)
-            label.configure(
-                text=file_label(path),
-                fg='#1b7f3a' if path else '#b00020',
-            )
+        self._refresh_calibration_button_texts()
+        self._refresh_robot_ip_controls()
         for service_name, ready in self.node.service_readiness_map().items():
             label = self._service_labels.get(service_name)
             if label is not None:
@@ -2363,6 +3048,17 @@ class RobotCellOrchestratorGui:
             if self._process_group_alive(pgid):
                 self._log(f'Cell External Bridge {mode_label} exited but child processes are still running; cleaning up')
                 self._stop_process(process, f'Cell External Bridge {mode_label}', pgid)
+        if self._nomachine_process is not None and self._nomachine_process.poll() is not None:
+            process = self._nomachine_process
+            pgid = self._nomachine_process_group
+            return_code = process.returncode
+            self._nomachine_process = None
+            self._nomachine_process_group = None
+            self.node.invalidate_nomachine_remote_access_status()
+            self._log(f'NoMachine Remote Access installer exited with code {return_code}')
+            if self._process_group_alive(pgid):
+                self._log('NoMachine Remote Access installer exited but child processes are still running; cleaning up')
+                self._stop_process(process, 'NoMachine Remote Access installer', pgid)
         self._refresh_status_views()
         self.root.after(PROCESS_SCAN_MS, self._periodic_process_scan)
 
@@ -2462,6 +3158,20 @@ class RobotCellOrchestratorGui:
             self._stop_launch(key)
             return True
         spec = self._launch_specs[key]
+        self._last_calibration_scan = self._scan_calibrations()
+        if self._launch_missing_calibration(spec):
+            keys = spec.calibration_key
+            required = (keys,) if isinstance(keys, str) else tuple(keys or ())
+            missing = [
+                calibration_kind
+                for calibration_kind in required
+                if self._last_calibration_scan.files.get(calibration_kind) is None
+            ]
+            message = f'Select calibration file(s) before launching {spec.label}: {", ".join(missing)}'
+            self._log(message)
+            messagebox.showwarning('Calibration Required', message, parent=self.root)
+            self._refresh_status_views()
+            return False
         launch_label = spec.label_for(headless)
         launch_file = spec.launch_file_for(headless)
         args = spec.args_builder(mode, headless) or []
@@ -2570,6 +3280,48 @@ class RobotCellOrchestratorGui:
         except Exception as exc:
             self._log(f'Failed to stop {label}: {exc}')
 
+    def _ensure_nomachine_remote_access(self) -> None:
+        if self._nomachine_auto_started:
+            return
+        self._nomachine_auto_started = True
+        self.node.invalidate_nomachine_remote_access_status()
+        if self.node.nomachine_remote_access_ready():
+            self._log('NoMachine Remote Access already ready')
+            self._refresh_status_views()
+            return
+        self._log('NoMachine Remote Access not ready; launching installer/startup automatically')
+        self._start_nomachine_remote_access()
+
+    def _is_nomachine_installer_running(self) -> bool:
+        return self._nomachine_process is not None and self._nomachine_process.poll() is None
+
+    def _start_nomachine_remote_access(self) -> bool:
+        script_path = workspace_root() / NOMACHINE_SERVICE_DISPLAY
+        if not script_path.exists():
+            message = f'NoMachine installer not found: {script_path}'
+            self._log(message)
+            messagebox.showerror('NoMachine Installer Missing', message, parent=self.root)
+            return False
+        env = os.environ.copy()
+        env['DOBOT_PICKN_PLACE_ROOT'] = str(workspace_root())
+        shell_command = (
+            f'cd {shlex.quote(str(workspace_root()))}; '
+            f'exec {shell_join(["bash", NOMACHINE_SERVICE_DISPLAY])}'
+        )
+        started = self._start_visible_terminal_process(
+            'NoMachine Remote Access',
+            shell_command,
+            env,
+        )
+        if started is None:
+            return False
+        process, pgid = started
+        self._nomachine_process = process
+        self._nomachine_process_group = pgid
+        self._log(f'Launched NoMachine Remote Access installer in terminal: {NOMACHINE_SERVICE_DISPLAY}')
+        self._refresh_status_views()
+        return True
+
     def _cell_bridge_clicked(self) -> None:
         if self._is_cell_bridge_running():
             self._stop_cell_bridge()
@@ -2582,6 +3334,7 @@ class RobotCellOrchestratorGui:
     def _start_cell_bridge(self) -> bool:
         mode = self._mode
         env = os.environ.copy()
+        env['ROS_LOCALHOST_ONLY'] = '1'
         for key, value in key_value_config(self.station_config_file).items():
             env.setdefault(key, value)
         python_path = str(self.cell_bridge_source_dir)
@@ -2776,11 +3529,15 @@ class RobotCellOrchestratorGui:
         if mode == MODE_ONLINE:
             config = RobotCellOrchestratorRuntimeSettings(
                 loop_enabled=True,
+                auto_repick_enabled=config.auto_repick_enabled,
                 step_mode_enabled=False,
                 tray_seek_stability_sec=config.tray_seek_stability_sec,
                 tray_intercept_x_offset_mm=config.tray_intercept_x_offset_mm,
                 tray_intercept_y_offset_mm=config.tray_intercept_y_offset_mm,
                 tray_ee_angle_deg=config.tray_ee_angle_deg,
+                eye_on_hand_calibration_file=config.eye_on_hand_calibration_file,
+                eye_to_hand_calibration_file=config.eye_to_hand_calibration_file,
+                platform_calibration_file=config.platform_calibration_file,
                 window_geometry=config.window_geometry,
             )
             self._reset_online_commands(ONLINE_PHASE_STARTING)
@@ -2824,6 +3581,7 @@ class RobotCellOrchestratorGui:
     def _read_runtime_settings(self) -> RobotCellOrchestratorRuntimeSettings:
         return RobotCellOrchestratorRuntimeSettings(
             loop_enabled=bool(self.loop_var.get()),
+            auto_repick_enabled=bool(self.auto_repick_var.get()),
             step_mode_enabled=bool(self.step_mode_var.get()),
             tray_seek_stability_sec=self._read_timing_slider(self.tray_seek_stability_sec_var),
             tray_intercept_x_offset_mm=self._read_clamped_var(
@@ -2841,6 +3599,9 @@ class RobotCellOrchestratorGui:
                 TRAY_EE_ANGLE_MIN_DEG,
                 TRAY_EE_ANGLE_MAX_DEG,
             ),
+            eye_on_hand_calibration_file=self.eye_on_hand_calibration_var.get().strip(),
+            eye_to_hand_calibration_file=self.eye_to_hand_calibration_var.get().strip(),
+            platform_calibration_file=self.platform_calibration_var.get().strip(),
             window_geometry=self._current_window_geometry(),
         )
 
@@ -2982,10 +3743,18 @@ class RobotCellOrchestratorGui:
         finally:
             self._set_offline_step_waiting(False)
 
+    def _apply_auto_repick_setting(self, cycle_index: int, enabled: bool) -> bool:
+        state = 'ON' if enabled else 'OFF'
+        self._set_status(f'Cycle {cycle_index}: setting Auto Repick {state}')
+        result = self.node.set_item_auto_repick(enabled)
+        self._log(f'[{cycle_index}] Auto Repick {state}: {"OK" if result.success else "FAIL"} - {result.message}')
+        return result.success and not self._stop_event.is_set()
+
     def _run_pick_side(self, config: RobotCellOrchestratorRuntimeSettings, cycle_index: int) -> bool:
         self._set_robot_status(ROBOT_STATUS_PICKING)
         return (
-            self._go_to_teach_step(cycle_index, 'Go to item detect teach', 'item_go_to_teach')
+            self._apply_auto_repick_setting(cycle_index, config.auto_repick_enabled)
+            and self._go_to_teach_step(cycle_index, 'Go to item detect teach', 'item_go_to_teach')
             and self._seek_step(
                 cycle_index,
                 'Arm item pick',
@@ -3058,20 +3827,20 @@ class RobotCellOrchestratorGui:
             return False
         if stability_sec is not None and stability_sec > 0.0:
             self._log(
-                f'[{cycle_index}] {arm_label}: armed; confirming robot stability '
+                f'[{cycle_index}] {arm_label}: armed; waiting for robot idle '
                 f'for {stability_sec:.1f}s before seek...'
             )
 
-            self._set_status(f'Cycle {cycle_index}: confirming robot stability before {seek_label}')
-            pre_seek_result = self.node.wait_for_robot_stable(self._stop_event, stability_sec)
+            self._set_status(f'Cycle {cycle_index}: waiting for robot idle before {seek_label}')
+            pre_seek_result = self.node.wait_for_robot_idle(self._stop_event, stability_sec)
             self._log(
                 f'[{cycle_index}] {seek_label}: '
-                f'{"STABLE" if pre_seek_result.success else "FAIL"} before seek - {pre_seek_result.message}'
+                f'{"IDLE" if pre_seek_result.success else "FAIL"} before seek - {pre_seek_result.message}'
             )
             if not pre_seek_result.success or self._stop_event.is_set():
                 if self._mode == MODE_ONLINE and (
                     'timed out' in pre_seek_result.message.lower()
-                    or 'did not become stable' in pre_seek_result.message.lower()
+                    or 'did not report idle' in pre_seek_result.message.lower()
                 ):
                     self.node.publish_phase_event(
                         'timeout',
@@ -3080,7 +3849,7 @@ class RobotCellOrchestratorGui:
                     )
                 return False
         else:
-            self._log(f'[{cycle_index}] {arm_label}: armed; skipping robot stability wait before {seek_label}.')
+            self._log(f'[{cycle_index}] {arm_label}: armed; skipping robot idle wait before {seek_label}.')
 
         if not self._click_step(cycle_index, seek_label, seek_client_key):
             return False
@@ -3218,8 +3987,10 @@ class RobotCellOrchestratorGui:
         self.tray_ee_angle_spinbox.configure(state=setting_state)
         self.offline_button.configure(state=setting_state)
         self.online_button.configure(state=setting_state)
+        self._refresh_robot_ip_controls()
         self._refresh_step_controls()
         self._refresh_teach_button_texts()
+        self._refresh_calibration_button_texts()
 
     def _refresh_step_controls(self) -> None:
         if not hasattr(self, 'step_button'):
