@@ -2,15 +2,15 @@
 
 `tray_perception` provides the RGB-D teach and detect workflow for trays. A tray
 profile is taught with `tray_teach_node`, then `tray_detect_node` loads the
-profile to publish tray pose, tray velocity, and tray dimensions for downstream
-motion packages.
+profile to publish continuous tray pose, an averaged seek target pose, and tray
+dimensions for downstream motion packages.
 
 ## Nodes
 
 | Node | Executable | Purpose |
 | --- | --- | --- |
 | `tray_teach` | `tray_teach_node` | Interactive OpenCV UI for teaching tray ROI, edge settings, and tray-plane reference. |
-| `tray_detect` | `tray_detect_node` | Runtime detector for tray pose, seek confidence, tray vector, and dimensions service. |
+| `tray_detect` | `tray_detect_node` | Runtime detector for tray pose, seek confidence, averaged target pose, and dimensions service. |
 
 ## Build
 
@@ -134,7 +134,7 @@ eye-on-hand file. It opens a filtered chooser, or requires
 | `tray_overlay` | `sensor_msgs/msg/Image` | Runtime debug/preview image. |
 | `tray_pose` | `geometry_msgs/msg/PoseStamped` | Filtered canonical tray pose: lower-left origin, tray edge X/Y, natural right-handed Z. |
 | `tray_axis_overlay` | `geometry_msgs/msg/PolygonStamped` | The same 2D origin and X/Y unit directions drawn on the camera overlay. |
-| `tray_vector` | `dobot_msgs_v4/msg/TrayVector` | Pose, timing, velocity, speed, and direction. |
+| `tray_target_pose` | `geometry_msgs/msg/PoseStamped` | Latched seek result: confidence-qualified poses averaged after position/orientation outlier rejection. |
 | `tray_cube_marker` | `visualization_msgs/msg/Marker` | RViz cube marker. |
 | `tray_detect/get_tray_dimensions` | `dobot_msgs_v4/srv/GetTrayDimensions` | Taught tray dimensions from the active profile. |
 
@@ -192,7 +192,7 @@ WORKSPACE_ROOT/debug files/seek_frames
 ```bash
 ros2 topic hz /tray_overlay
 ros2 topic hz /tray_pose
-ros2 topic echo /tray_vector --once
+ros2 topic echo /tray_target_pose --once
 ros2 service call /tray_detect/get_tray_dimensions dobot_msgs_v4/srv/GetTrayDimensions {}
 ```
 

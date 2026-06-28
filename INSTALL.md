@@ -64,7 +64,7 @@ test -f third_party/yolo/checkpoints/yolo11n-seg.pt
 Run this only on the development/staging PC, not on the offline client PC:
 
 ```bash
-cd /home/erds/DOBOT_pickn_place
+cd "$HOME/DOBOT_pickn_place"
 tools/deps/fetch_offline_deps.sh
 ```
 
@@ -76,7 +76,7 @@ payloads but leaves out local build output and the local virtual environment,
 which will be recreated on the client PC:
 
 ```bash
-cd /home/erds
+cd "$HOME"
 tar \
   --exclude='DOBOT_pickn_place/build' \
   --exclude='DOBOT_pickn_place/install' \

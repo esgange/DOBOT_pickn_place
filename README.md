@@ -101,7 +101,7 @@ Optional pieces are isolated:
 | --- | --- |
 | YOLO/SAM2 item teach/detect | `third_party/.venv`, `third_party/sam2`, `third_party/yolo`, `requirements.lock.txt` |
 | RabbitMQ external bridge | `cell_external_bridge` installed into `third_party/.venv` |
-| Full remote desktop access | `NoMachine/` helper scripts and bundled `amd64` installer |
+| Full remote desktop access | `NoMachine/` helper scripts; optional installer cache in `NoMachine/debs/` |
 | Fully offline client PC | `third_party/debs`, `third_party/wheels`, `tools/deps/install_offline_deps.sh` |
 
 On an internet-connected staging machine, prepare the offline bundle with:
@@ -148,10 +148,9 @@ source tools/deps/source_third_party_env.sh
 | `platform_calibration` | `src/platform_calibration` | Fixed platform/bin reference calibration. |
 | `aruco_perception` | `src/aruco_perception` | RGB-D ArUco pose detection and calibrated camera TF publishing. |
 | `obstacle_perception` | `src/obstacle_perception` | Live depth obstacles and persistent obstacle memory. |
-| `tray_perception` | `src/tray_perception` | Tray teach/detect with tray pose, vector, and dimension output. |
+| `tray_perception` | `src/tray_perception` | Tray teach/detect with tray pose, averaged target pose, and dimension output. |
 | `tray_intercept` | `src/tray_intercept` | Operator console and motion service for tray interception. |
-| `item_perception` | `src/item_perception` | Classic item teach/detect using bin ROI profiles and depth geometry. |
-| `item_perception_yolo` | `src/item_perception_yolo` | Optional YOLO/SAM2 item teach/detect using the same item-pick handoff protocol. |
+| `item_perception_yolo` | `src/item_perception_yolo` | YOLO/SAM2 item teach/detect using the item-pick handoff protocol. |
 | `item_pick` | `src/item_pick` | Operator GUI and motion sequence for item pose pickup. |
 | `robot_cell_orchestrator` | `src/robot_cell_orchestrator` | Main cell GUI, node launcher, runtime validation, and online API. |
 | `gripper_control` | `src/gripper_control` | GUI for DOBOT gripper digital outputs. |
@@ -218,7 +217,7 @@ Typical manual/lab order when launching pieces yourself:
 ros2 launch orbbec_camera_launcher camera_launcher.launch.py
 ros2 launch cr_robot_ros2 dobot_bringup_ros2.launch.py station_config:=station_config
 ros2 launch dobot_rviz dobot_rviz.launch.py
-ros2 launch item_perception item_detect.launch.py
+ros2 launch item_perception_yolo item_detect_yolo.launch.py
 ros2 launch item_pick item_pick.launch.py
 ros2 launch tray_perception tray_detect.launch.py
 ros2 launch tray_intercept tray_intercept.launch.py
@@ -230,7 +229,22 @@ immediately; missing configured cameras are logged in the launcher instead of
 blocking startup behind a warning click. Camera drivers are supervised after
 startup: `/camera_watchdog/status` reports per-camera health,
 `/camera_watchdog/healthy` reports aggregate health, and stale or exited camera
-drivers are relaunched automatically with bounded backoff.
+drivers are relaunched automatically with bounded backoff. The GUI **Stop
+Cameras** button and window close both clean up the tracked launch process
+groups and any still-running Orbbec driver groups whose camera names match the
+saved serial/name mapping, so camera topics should not keep streaming invisibly
+after the launcher is closed.
+
+If `ros2 topic list` still shows an old image topic after stopping cameras,
+check whether anything is actually publishing:
+
+```bash
+ros2 topic info /bin_camera/color/image_raw -v
+```
+
+`Publisher count: 0` means the camera driver is stopped; the topic name can
+remain visible while another node is still subscribed or while discovery cache
+settles.
 
 Headless production support stack:
 
@@ -261,7 +275,7 @@ Most perception launch files accept `color_topic`, `depth_topic`, and
 `camera_info_topic` overrides:
 
 ```bash
-ros2 launch item_perception item_detect.launch.py \
+ros2 launch item_perception_yolo item_detect_yolo.launch.py \
   color_topic:=/custom_camera/color/image_raw \
   depth_topic:=/custom_camera/depth/image_raw \
   camera_info_topic:=/custom_camera/color/camera_info
@@ -274,11 +288,11 @@ Generated robot-cell data is kept outside `src/`.
 | Path | Owner | Purpose |
 | --- | --- | --- |
 | `calibration/` | camera/platform/movement calibration | Camera calibration YAML, platform calibration YAML, and movement calibration data. |
-| `teach/bin_teach/` | item/tray perception | Bin profiles and ROI/depth-plane teach files. |
-| `teach/item_teach/` | classic item perception, item pick | Item teach profiles, dimensions, and item-pick tool/EE settings. |
-| `teach/item_teach_yolo/` | YOLO item perception | Final YOLO item profiles and model bundles. |
+| `teach/bin_teach/` | item/tray perception | Platform-referenced bin profiles and ROI corner teach files. |
+| `teach/item_teach_yolo/` | YOLO item perception, item pick | Final YOLO item profiles, model bundles, and item-pick tool/EE settings. |
 | `teach/tray_teach/` | tray perception | Tray profiles and taught tray dimensions. |
-| `config/item_perception/` | item perception, item pick | Runtime settings and selected item profile handoff. |
+| `config/item_perception_yolo/` | YOLO item perception | Runtime settings and selected item profile handoff. |
+| `config/item_pick/` | item pick | Runtime motion settings for item pick. |
 | `config/tray_perception/` | tray perception, tray intercept | Runtime settings and selected tray profile handoff. |
 | `config/camera_bringup/` | Orbbec launcher | Camera serial/name mapping and Orbbec launch options. |
 | `config/robot_cell_orchestrator/` | orchestrator | Headless/runtime-stack launch settings. |
@@ -315,24 +329,31 @@ for `item_pick`:
 - Seek ON performs one detection handoff and publishes the item target pose.
 - Item pick arms, receives one pose, executes one pick routine, then returns to
   standby after final Z-up.
+- Before computing the final orientation, item pick waits for controller idle,
+  reads the current TCP pose, and chooses the least-rotation candidate that keeps
+  the eye-on-hand camera frame inside the taught bin footprint.
+- When both the initial and 180-degree final orientations would put the camera
+  outside the bin ROI, item pick asks item detect for another pose with
+  `item_detect/repick` up to 3 times. If all retries fail, it logs
+  `No valid item to pick`, stops that pick cycle, and keeps the item pick node
+  alive for inspection.
 - If suction feedback fails after retract and Auto Repick is enabled, item pick
   releases, returns to the saved start joints, and calls the item detect repick
   service so detect reacquires without a manual Seek OFF/ON cycle.
 - TF-only mode does not send motion commands. It publishes the goal TF so the
   pose can be checked in RViz, then returns item pick to standby.
 
-See [src/item_perception/README.md](src/item_perception/README.md),
-[src/item_perception_yolo/README.md](src/item_perception_yolo/README.md), and
+See [src/item_perception_yolo/README.md](src/item_perception_yolo/README.md) and
 [src/item_pick/README.md](src/item_pick/README.md) for the full topic/service
 contract.
 
-## YOLO/SAM2 Optional Flow
+## YOLO/SAM2 Item Flow
 
-YOLO/SAM2 is not required for the core robot cell. Use it only in terminals that
-source the frozen third-party Python environment:
+Use the frozen third-party Python environment for YOLO/SAM2 teach and detect:
 
 ```bash
 source tools/deps/source_third_party_env.sh
+ros2 launch item_perception_yolo bin_teach_yolo.launch.py
 ros2 launch item_perception_yolo item_teach_yolo.launch.py
 ros2 launch item_perception_yolo item_detect_yolo.launch.py
 ```
@@ -344,8 +365,7 @@ third_party/sam2/checkpoints/sam2.1_hiera_tiny.pt
 third_party/yolo/checkpoints/yolo11n-seg.pt
 ```
 
-YOLO detect keeps the ROS node name `item_detect`, so it can replace the classic
-detect node for item-pick handoff when only one detect node is running.
+YOLO detect keeps the ROS node name `item_detect` for item-pick handoff.
 
 ## Repo Hygiene
 
@@ -356,12 +376,17 @@ Keep source and generated data separate:
 - Do not commit `build/`, `install/`, `log/`, `.venv/`, generated teach files,
   runtime configs, model training outputs, or local calibration captures unless
   you are deliberately packaging a release artifact.
+- Generated Python caches are disposable. For a local source cleanup, remove
+  `__pycache__/`, `.pytest_cache/`, `.mypy_cache/`, and `.ruff_cache/`; leave
+  operator-owned `calibration/`, `teach/`, `runtime/`, and `config/*` data unless
+  you are doing an explicit station reset.
 - Large payloads under `third_party/debs`, `third_party/wheels`,
   `third_party/sam2`, and `third_party/yolo` are for offline transfer bundles.
   A plain git clone should be usable for source work, while a client-PC archive
   should include those ignored payloads.
-- `NoMachine/debs/` is an intentional station-access installer cache; update its
-  checksum file whenever the bundled installer changes.
+- `NoMachine/debs/` is an optional station-access installer cache. Keep DEBs out
+  of normal source commits; refresh the cache and checksum file only for an
+  explicit offline handoff bundle.
 - Prefer package-level README files for operator details, because robot motion
   workflows are safer when the launch commands and IO assumptions stay close to
   the package that owns them.
@@ -406,5 +431,12 @@ tools/deps/verify_offline_env.sh
   reinstall the Python bundle with `tools/deps/install_offline_deps.sh --python-only`.
 - If ROS nodes cannot see each other, check `ROS_LOCALHOST_ONLY`,
   `ROS_DOMAIN_ID`, and whether both terminals sourced the same workspace.
+- If camera topics appear to stream after closing the camera launcher, first run
+  `ros2 topic info TOPIC -v`. A nonzero publisher count means a camera driver is
+  still alive; press **Stop Cameras** or close/reopen the launcher so it can
+  sweep configured Orbbec process groups.
+- If robot bringup cannot connect, verify the PC and `ROBOT_IP_ADDRESS` are on
+  the same subnet, then restart Robot Bringup. The TCP bridge reconnects its
+  feedback/dashboard sockets after disconnects and closes them during shutdown.
 - If a workflow sends robot motion, verify robot IP, robot type, tool settings,
   calibration file, and camera topics before arming motion.

@@ -87,6 +87,16 @@ If at least one configured camera is detected, it launches valid camera nodes
 immediately. Missing configured cameras are written to the launcher scan log and
 do not block startup behind a warning click.
 
+Camera launcher Stop/Close runs a cleanup sweep for the saved configured camera
+names. It stops tracked launch terminals/watchdogs and any still-running Orbbec
+driver process groups that match the saved serial/name mapping. If ROS still
+lists a topic after stopping cameras, check publisher count:
+
+   ros2 topic info /bin_camera/color/image_raw -v
+
+Publisher count 0 means no driver is streaming; the topic can remain because a
+consumer is subscribed or discovery cache has not settled.
+
 Offline/client PC deployment
 ----------------------------
 
@@ -146,8 +156,13 @@ Repo cleanup policy
 
 Do not delete user calibration/teach/runtime files during cleanup unless the
 operator explicitly asks for a reset. Do not commit build/install/log outputs,
-third_party binary payloads, Python caches, ROS bags, model runs, or local
-station secrets. `NoMachine/debs/` is the one intentional remote-access
-installer cache; keep its SHA256SUMS in sync when refreshing it. Keep
-package-specific operator details in the package README that owns the motion or
-perception behavior.
+third_party binary payloads, Python caches, ROS bags, model runs, local station
+secrets, or NoMachine installer DEBs. Use `NoMachine/cache_nomachine_debs.sh`
+only for explicit offline handoff bundles, and keep SHA256SUMS in sync when
+refreshing that cache. Keep package-specific operator details in the package
+README that owns the motion or perception behavior.
+
+Safe local cleanup includes generated `__pycache__/`, `.pytest_cache/`,
+`.mypy_cache/`, and `.ruff_cache/` directories. Leave `runtime/`, `teach/`,
+`calibration/`, and station `config/` data in place unless the requested task is
+an explicit station reset.

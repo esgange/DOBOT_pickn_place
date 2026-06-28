@@ -85,6 +85,10 @@ The GUI runs one supervisor per camera, so its interfaces are under
 `/camera_watchdog/CAMERA_NAME/`, for example
 `/camera_watchdog/bin_camera/healthy`.
 
+Watchdog-owned Orbbec driver launches run in their own process groups. On Linux,
+the child launch process also receives a parent-death signal, so a driver should
+not survive silently if its watchdog process exits before normal shutdown runs.
+
 Useful checks:
 
 ```bash
@@ -187,8 +191,23 @@ On startup and on manual `Launch Cameras`, the GUI:
 The running status shows which camera is starting and which cameras are verified.
 `Launch Cameras` is disabled while any tracked camera node is running or while a
 launch sequence is in progress. `Stop Cameras` stays available; if no camera is
-running, it reports that there are no camera nodes to stop. Window close sends
-shutdown signals to the tracked process groups, so child camera driver nodes are
-cleaned up with their launch terminal. If no supported terminal emulator is
-available, the GUI refuses to launch camera drivers instead of creating hidden
-background nodes.
+running, it still scans for configured Orbbec process groups and cleans up any
+stale driver processes that match the saved serial/name mapping. Window close
+runs the same shutdown path, including tracked terminals, watchdogs, and stale
+configured driver groups.
+
+If `ros2 topic list` still shows a camera topic after stopping the launcher,
+check publisher state rather than only topic presence:
+
+```bash
+ros2 topic info /bin_camera/color/image_raw -v
+```
+
+`Publisher count: 0` means no camera driver is publishing; the topic can remain
+listed while another node is subscribed or while ROS discovery cache settles. A
+nonzero publisher count means a driver is still alive; reopen the launcher and
+press **Stop Cameras**, or stop the matching process group manually after checking
+the configured camera name.
+
+If no supported terminal emulator is available, the GUI refuses to launch camera
+drivers instead of creating hidden background nodes.

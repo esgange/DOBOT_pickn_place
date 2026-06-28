@@ -91,6 +91,7 @@ def ros_sourced_shell_command(cmd: list[str]) -> str:
         'set -e; '
         f'ROOT="${{DOBOT_PICKN_PLACE_ROOT:-{root}}}"; '
         'cd "$ROOT"; '
+        'export DOBOT_PICKN_PLACE_ROOT="$ROOT"; '
         'if [ -f /opt/ros/humble/setup.bash ]; then source /opt/ros/humble/setup.bash; fi; '
         'if [ -f "$ROOT/install/setup.bash" ]; then source "$ROOT/install/setup.bash"; fi; '
         'if [ -f "$ROOT/third_party/.venv/bin/activate" ]; then source "$ROOT/third_party/.venv/bin/activate"; fi; '
@@ -326,6 +327,7 @@ class CameraLauncherApp:
         self.launching = False
         self.launch_stop_requested = False
         self.closing = False
+        self.shutdown_complete = False
 
         self.scan_button = None
         self.copy_first_button = None
@@ -1391,17 +1393,180 @@ class CameraLauncherApp:
             for process in self.launch_processes
         )
 
-    def _stop_cameras(self) -> None:
+    def _configured_camera_names(self) -> set[str]:
+        try:
+            pairs = self._configured_camera_pairs()
+        except tk.TclError:
+            payload = _load_yaml(self.config_path)
+            cameras = payload.get('cameras', [])
+            pairs = cameras if isinstance(cameras, list) else []
+        return {
+            str(pair.get('camera_name', '')).strip()
+            for pair in pairs
+            if (
+                isinstance(pair, dict)
+                and str(pair.get('serial_number', '')).strip()
+                and str(pair.get('camera_name', '')).strip()
+            )
+        }
+
+    def _protected_process_groups(self) -> set[int]:
+        protected = set()
+        if not hasattr(os, 'getpgid'):
+            return protected
+        for pid in (os.getpid(), os.getppid()):
+            try:
+                protected.add(os.getpgid(pid))
+            except (OSError, ProcessLookupError):
+                pass
+        return protected
+
+    def _matched_camera_process_name(self, command: str, camera_names: set[str]) -> str | None:
+        relevant_tokens = (
+            'orbbec_camera',
+            'camera_headless.launch.py',
+            'camera_watchdog',
+            'component_container',
+        )
+        if not any(token in command for token in relevant_tokens):
+            return None
+
+        for camera_name in sorted(camera_names, key=len, reverse=True):
+            matches = (
+                f'camera_name:={camera_name}',
+                f'enabled_cameras:={camera_name}',
+                f'__ns:=/{camera_name}',
+                f'__ns:={camera_name}',
+                f'camera_watchdog/{camera_name}',
+                f"camera_names:=['{camera_name}']",
+                f'camera_names:=[{camera_name}]',
+                f'camera_names:={camera_name}',
+            )
+            if any(token in command for token in matches):
+                return camera_name
+        return None
+
+    def _find_configured_camera_process_groups(self, update_ui: bool = True) -> list[dict[str, object]]:
+        camera_names = self._configured_camera_names()
+        if not camera_names or not hasattr(os, 'killpg'):
+            return []
+
+        try:
+            result = subprocess.run(
+                ['ps', '-eo', 'pid=,ppid=,pgid=,sid=,cmd='],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=2.0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            if update_ui:
+                self._append_scan_text(f'\nCould not scan for stale camera processes: {exc}\n')
+            return []
+
+        if result.returncode not in (0, None):
+            error = (result.stderr or '').strip()
+            if error and update_ui:
+                self._append_scan_text(f'\nCould not scan for stale camera processes:\n{error}\n')
+            return []
+
+        groups: dict[int, dict[str, object]] = {}
+        protected_pgids = self._protected_process_groups()
+        for raw_line in (result.stdout or '').splitlines():
+            parts = raw_line.strip().split(None, 4)
+            if len(parts) < 5:
+                continue
+            try:
+                pid = int(parts[0])
+                pgid = int(parts[2])
+            except ValueError:
+                continue
+            command = parts[4]
+            if pid == os.getpid() or pgid <= 1 or pgid in protected_pgids:
+                continue
+            camera_name = self._matched_camera_process_name(command, camera_names)
+            if camera_name is None:
+                continue
+            entry = groups.setdefault(
+                pgid,
+                {
+                    'pgid': pgid,
+                    'pids': set(),
+                    'camera_names': set(),
+                    'commands': [],
+                },
+            )
+            entry['pids'].add(pid)
+            entry['camera_names'].add(camera_name)
+            entry['commands'].append(command)
+
+        ordered = sorted(groups.values(), key=lambda item: int(item['pgid']))
+        for entry in ordered:
+            entry['pids'] = sorted(entry['pids'])
+            entry['camera_names'] = sorted(entry['camera_names'])
+        return ordered
+
+    def _terminate_process_group(self, pgid: int) -> bool:
+        if not hasattr(os, 'killpg') or not self._process_group_alive(pgid):
+            return True
+
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(pgid, sig)
+            except ProcessLookupError:
+                return True
+            except PermissionError:
+                return False
+
+            deadline = time.monotonic() + PROCESS_STOP_TIMEOUT_SEC
+            while time.monotonic() < deadline:
+                if not self._process_group_alive(pgid):
+                    return True
+                time.sleep(0.05)
+        return not self._process_group_alive(pgid)
+
+    def _cleanup_configured_camera_processes(self, update_ui: bool = True) -> int:
+        groups = self._find_configured_camera_process_groups(update_ui=update_ui)
+        if not groups:
+            return 0
+
+        if update_ui:
+            lines = []
+            for group in groups:
+                names = ', '.join(group['camera_names'])
+                pids = ', '.join(str(pid) for pid in group['pids'])
+                lines.append(f'  {names}: process group {group["pgid"]}, pid(s) {pids}')
+            self._append_scan_text(
+                '\nCleaning up configured camera processes that were still running:\n'
+                + '\n'.join(lines)
+                + '\n'
+            )
+
+        stopped = 0
+        failed = []
+        for group in groups:
+            pgid = int(group['pgid'])
+            if self._terminate_process_group(pgid):
+                stopped += 1
+            else:
+                failed.append(str(pgid))
+
+        if failed and update_ui:
+            self._append_scan_text(
+                '\nSome camera process groups did not stop: '
+                + ', '.join(failed)
+                + '\n'
+            )
+        return stopped
+
+    def _stop_cameras(self, update_ui: bool = True) -> None:
         self.launch_stop_requested = True
         self.pending_launch_pairs = []
         self.launching = False
-        if not self.launch_processes and not self._any_process_running():
-            self.running_var.set('Cameras stopped')
-            self._append_scan_text('\nNo camera nodes are currently running.\n')
-            self._update_ui_state()
-            self.status_var.set('No camera nodes are currently running')
-            return
-        self.running_var.set('Stopping cameras...')
+        tracked_running = bool(self.launch_processes) or self._any_process_running()
+        if tracked_running and update_ui:
+            self.running_var.set('Stopping cameras...')
         for process in list(self.launch_processes):
             pgid = self.launch_process_groups.pop(process.pid, None)
             self._terminate_process(process, pgid)
@@ -1410,8 +1575,17 @@ class CameraLauncherApp:
         self.process_labels = {}
         self.process_pairs = {}
         self.ready_process_pids = set()
+        cleaned_groups = self._cleanup_configured_camera_processes(update_ui=update_ui)
+        if not update_ui:
+            return
         self.running_var.set('Cameras stopped')
-        self._append_scan_text('\nStopped camera launch processes and child camera nodes.\n')
+        if tracked_running:
+            self._append_scan_text('\nStopped camera launch processes and child camera nodes.\n')
+        elif cleaned_groups:
+            self._append_scan_text('\nStopped stale configured camera process group(s).\n')
+        else:
+            self._append_scan_text('\nNo camera nodes are currently running.\n')
+            self.status_var.set('No camera nodes are currently running')
         self._update_ui_state()
 
     def _send_process_signal(
@@ -1464,17 +1638,36 @@ class CameraLauncherApp:
         self._send_process_signal(process, pgid, signal.SIGKILL)
         self._wait_process_or_group_stopped(process, pgid, 1.0)
 
-    def _on_close(self) -> None:
+    def shutdown(self, update_ui: bool = True) -> None:
+        if self.shutdown_complete:
+            return
         self.closing = True
-        if self._any_process_running():
-            self._stop_cameras()
+        self._stop_cameras(update_ui=update_ui)
+        self.shutdown_complete = True
+
+    def _on_close(self) -> None:
+        self.shutdown()
         self.root.destroy()
 
 
 def main() -> None:
     root = tk.Tk()
     app = CameraLauncherApp(root)
-    root.mainloop()
+    def request_shutdown(_signum=None, _frame=None) -> None:
+        try:
+            root.after(0, lambda: (app.shutdown(), root.destroy()))
+        except tk.TclError:
+            app.shutdown(update_ui=False)
+
+    for signal_name in ('SIGINT', 'SIGTERM', 'SIGHUP'):
+        sig = getattr(signal, signal_name, None)
+        if sig is not None:
+            signal.signal(sig, request_shutdown)
+
+    try:
+        root.mainloop()
+    finally:
+        app.shutdown(update_ui=False)
 
 
 if __name__ == '__main__':

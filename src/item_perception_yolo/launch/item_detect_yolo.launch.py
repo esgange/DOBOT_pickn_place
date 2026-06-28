@@ -146,7 +146,11 @@ def _calibration_matches_robot_ip(path: Path, robot_ip_address: str) -> bool:
     return path.stem.endswith(f"_{ip_token}")
 
 
-def _find_latest_calibration(calibration_dir: str, robot_ip_address: str = "") -> str:
+def _find_latest_calibration(
+    calibration_dir: str,
+    robot_ip_address: str = "",
+    filename_prefix: str = "axab_calibration_eyetohand_",
+) -> str:
     try:
         robot_ip_address = str(robot_ip_address or "").strip()
         if not robot_ip_address:
@@ -160,7 +164,7 @@ def _find_latest_calibration(calibration_dir: str, robot_ip_address: str = "") -
             if not path.is_file() or path.suffix != ".yaml" or path.stat().st_size <= 0:
                 continue
             name = path.name
-            if name.startswith("axab_calibration_eyetohand_"):
+            if name.startswith(filename_prefix):
                 if _calibration_matches_robot_ip(path, robot_ip_address):
                     exact_files.append(path)
         if not exact_files:
@@ -184,12 +188,6 @@ def _launch_setup(context, *args, **kwargs):
     params_file = LaunchConfiguration("params_file").perform(context).strip()
     profiles_dir = LaunchConfiguration("profiles_dir").perform(context)
     model_root = LaunchConfiguration("model_root").perform(context)
-    selected_model_path = os.path.expanduser(
-        LaunchConfiguration("selected_model_path").perform(context).strip()
-    )
-    selected_profile_path = os.path.expanduser(
-        LaunchConfiguration("selected_profile_path").perform(context).strip()
-    )
     runtime_settings_file = os.path.expanduser(
         LaunchConfiguration("runtime_settings_file").perform(context).strip()
     )
@@ -221,23 +219,36 @@ def _launch_setup(context, *args, **kwargs):
     child_frame = LaunchConfiguration("child_frame").perform(context)
     calibration_dir = os.path.expanduser(LaunchConfiguration("calibration_dir").perform(context))
     calibration_file = os.path.expanduser(LaunchConfiguration("calibration_file").perform(context))
+    platform_calibration_dir = os.path.expanduser(
+        LaunchConfiguration("platform_calibration_dir").perform(context)
+    )
+    platform_calibration_file = os.path.expanduser(
+        LaunchConfiguration("platform_calibration_file").perform(context)
+    )
+    platform_parent_frame = LaunchConfiguration("platform_parent_frame").perform(context)
+    platform_frame = LaunchConfiguration("platform_frame").perform(context)
     robot_ip_address = _resolve_robot_ip_address(
         LaunchConfiguration("robot_ip_address").perform(context)
     )
     camera_frame_override = LaunchConfiguration("camera_frame").perform(context).strip()
     start_visualization = _to_bool(LaunchConfiguration("start_visualization").perform(context))
     headless = _to_bool(LaunchConfiguration("headless").perform(context))
-    align_item_z_axis_to_depth_plane = _to_bool(
-        LaunchConfiguration("align_item_z_axis_to_depth_plane").perform(context)
-    )
     python_executable = LaunchConfiguration("python_executable").perform(context)
     yolo_imgsz = LaunchConfiguration("yolo_imgsz")
     yolo_conf = LaunchConfiguration("yolo_conf")
+    detect_roi_margin_px = LaunchConfiguration("detect_roi_margin_px")
     yolo_iou = LaunchConfiguration("yolo_iou")
     max_inference_hz = LaunchConfiguration("max_inference_hz")
-    onnxruntime_threads = LaunchConfiguration("onnxruntime_threads")
+    pt_device = LaunchConfiguration("pt_device")
     seek_window_sec = LaunchConfiguration("seek_window_sec")
     seek_decay_sec = LaunchConfiguration("seek_decay_sec")
+    seek_snapshots_dir = os.path.expanduser(
+        LaunchConfiguration("seek_snapshots_dir").perform(context).strip()
+    )
+    seek_diagnostic_image_enabled = LaunchConfiguration("seek_diagnostic_image_enabled")
+    seek_diagnostic_image_path = os.path.expanduser(
+        LaunchConfiguration("seek_diagnostic_image_path").perform(context).strip()
+    )
 
     selected_file = ""
     if use_calibration:
@@ -279,6 +290,49 @@ def _launch_setup(context, *args, **kwargs):
                 raise RuntimeError(msg)
         print(f"[item_detect_yolo.launch] Using calibration file: {selected_file}")
 
+    selected_platform_file = ""
+    if platform_calibration_file:
+        selected_platform_file = platform_calibration_file
+        if not _calibration_file_is_usable(selected_platform_file):
+            msg = (
+                "[item_detect_yolo.launch] platform_calibration_file is set but missing/empty: "
+                f"{selected_platform_file}"
+            )
+            _show_missing_calibration_dialog(msg)
+            raise RuntimeError(msg)
+    else:
+        selection = _calibration_selection_helper()
+        if selection.requires_manual_selection(robot_ip_address):
+            selected_platform_file = selection.choose_required_calibration(
+                calibration_dir=platform_calibration_dir,
+                filename_pattern="platform_calibration_*.yaml",
+                calibration_label="platform calibration",
+                launch_label="item_detect_yolo.launch",
+                robot_ip_address=robot_ip_address,
+            )
+        else:
+            selected_platform_file = _find_latest_calibration(
+                platform_calibration_dir,
+                robot_ip_address,
+                "platform_calibration_",
+            )
+        if not selected_platform_file:
+            if robot_ip_address:
+                msg = (
+                    "[item_detect_yolo.launch] No non-empty platform calibration YAML "
+                    f"tagged for robot IP {robot_ip_address} found in {platform_calibration_dir}. "
+                    "Provide one via platform_calibration_file:=<path>."
+                )
+            else:
+                msg = (
+                    "[item_detect_yolo.launch] No robot IP was resolved for platform calibration "
+                    "auto-selection. Provide robot_ip_address:=<ip> or "
+                    "platform_calibration_file:=<path>."
+                )
+            _show_missing_calibration_dialog(msg)
+            raise RuntimeError(msg)
+    print(f"[item_detect_yolo.launch] Using platform calibration file: {selected_platform_file}")
+
     bin_camera_frame = camera_frame_override
     if not bin_camera_frame and use_calibration:
         bin_camera_frame = child_frame
@@ -287,8 +341,6 @@ def _launch_setup(context, *args, **kwargs):
         {
             "profiles_dir": profiles_dir,
             "model_root": model_root,
-            "selected_model_path": selected_model_path,
-            "selected_profile_path": selected_profile_path,
             "runtime_settings_file": runtime_settings_file,
             "selected_model_export_file": selected_model_export_file,
             "selected_profile_export_file": selected_profile_export_file,
@@ -315,16 +367,26 @@ def _launch_setup(context, *args, **kwargs):
             "calibration_child_frame": child_frame,
             "calibration_dir": calibration_dir,
             "calibration_file": selected_file,
+            "platform_calibration_dir": platform_calibration_dir,
+            "platform_calibration_file": selected_platform_file,
+            "platform_parent_frame": platform_parent_frame,
+            "platform_frame": platform_frame,
             "robot_ip_address": robot_ip_address,
             "auto_discover_calibration": False,
-            "align_item_z_axis_to_depth_plane": align_item_z_axis_to_depth_plane,
             "yolo_imgsz": ParameterValue(yolo_imgsz, value_type=int),
             "yolo_conf": ParameterValue(yolo_conf, value_type=float),
+            "detect_roi_margin_px": ParameterValue(detect_roi_margin_px, value_type=float),
             "yolo_iou": ParameterValue(yolo_iou, value_type=float),
             "max_inference_hz": ParameterValue(max_inference_hz, value_type=float),
-            "onnxruntime_threads": ParameterValue(onnxruntime_threads, value_type=int),
+            "pt_device": ParameterValue(pt_device, value_type=str),
             "seek_window_sec": ParameterValue(seek_window_sec, value_type=float),
             "seek_decay_sec": ParameterValue(seek_decay_sec, value_type=float),
+            "seek_snapshots_dir": seek_snapshots_dir,
+            "seek_diagnostic_image_enabled": ParameterValue(
+                seek_diagnostic_image_enabled,
+                value_type=bool,
+            ),
+            "seek_diagnostic_image_path": seek_diagnostic_image_path,
         }
     ]
     if params_file:
@@ -381,14 +443,6 @@ def generate_launch_description():
             default_value=_repo_path("teach", "item_teach_yolo"),
         ),
         DeclareLaunchArgument(
-            "selected_model_path",
-            default_value="",
-        ),
-        DeclareLaunchArgument(
-            "selected_profile_path",
-            default_value="",
-        ),
-        DeclareLaunchArgument(
             "runtime_settings_file",
             default_value=_repo_path("config", "item_perception_yolo", "item_detect_yolo_runtime_settings.yaml"),
         ),
@@ -398,7 +452,11 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "selected_profile_export_file",
-            default_value=_repo_path("config", "item_perception", "item_detect_selected_profile.txt"),
+            default_value=_repo_path(
+                "config",
+                "item_perception_yolo",
+                "item_detect_yolo_selected_profile.txt",
+            ),
         ),
         DeclareLaunchArgument(
             "selected_profile_topic",
@@ -426,7 +484,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "bin_pose_topic",
-            default_value="bin_seek_pose",
+            default_value="item_seek_pose",
         ),
         DeclareLaunchArgument(
             "bin_item_pose_array_topic",
@@ -477,9 +535,28 @@ def generate_launch_description():
             default_value="",
         ),
         DeclareLaunchArgument(
+            "platform_calibration_dir",
+            default_value=_repo_path("calibration"),
+        ),
+        DeclareLaunchArgument(
+            "platform_calibration_file",
+            default_value="",
+        ),
+        DeclareLaunchArgument(
+            "platform_parent_frame",
+            default_value="base_link",
+        ),
+        DeclareLaunchArgument(
+            "platform_frame",
+            default_value="platform_reference",
+        ),
+        DeclareLaunchArgument(
             "robot_ip_address",
             default_value="",
-            description="Robot controller IP for calibration file discovery. Empty uses ROBOT_IP_ADDRESS/station_config.",
+            description=(
+                "Robot controller IP for calibration file discovery. "
+                "Empty uses ROBOT_IP_ADDRESS/station_config."
+            ),
         ),
         DeclareLaunchArgument(
             "camera_frame",
@@ -494,19 +571,29 @@ def generate_launch_description():
             default_value="false",
         ),
         DeclareLaunchArgument(
-            "align_item_z_axis_to_depth_plane",
-            default_value="true",
-        ),
-        DeclareLaunchArgument(
             "python_executable",
             default_value=_repo_path(".venv", "bin", "python"),
         ),
         DeclareLaunchArgument("yolo_imgsz", default_value="640"),
         DeclareLaunchArgument("yolo_conf", default_value="0.35"),
+        DeclareLaunchArgument("detect_roi_margin_px", default_value="0.0"),
         DeclareLaunchArgument("yolo_iou", default_value="0.45"),
         DeclareLaunchArgument("max_inference_hz", default_value="8.0"),
-        DeclareLaunchArgument("onnxruntime_threads", default_value="0"),
+        DeclareLaunchArgument(
+            "pt_device",
+            default_value="cpu",
+            description="Compatibility option; .pt item detection is always CPU-only.",
+        ),
         DeclareLaunchArgument("seek_window_sec", default_value="60.0"),
         DeclareLaunchArgument("seek_decay_sec", default_value="1.0"),
+        DeclareLaunchArgument(
+            "seek_snapshots_dir",
+            default_value=_repo_path("debug files", "seek_frames"),
+        ),
+        DeclareLaunchArgument("seek_diagnostic_image_enabled", default_value="true"),
+        DeclareLaunchArgument(
+            "seek_diagnostic_image_path",
+            default_value=_repo_path("debug files", "item_seek.png"),
+        ),
         OpaqueFunction(function=_launch_setup),
     ])

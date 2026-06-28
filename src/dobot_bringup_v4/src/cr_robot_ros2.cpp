@@ -3,6 +3,19 @@
 
 CRRobotRos2::CRRobotRos2() : rclcpp::Node("dobot_bringup_ros2"){};
 
+CRRobotRos2::~CRRobotRos2()
+{
+    is_running_ = false;
+    if (threadPubFeedBackInfo.joinable())
+    {
+        threadPubFeedBackInfo.join();
+    }
+    if (threadPub200mSDIStatus.joinable())
+    {
+        threadPub200mSDIStatus.join();
+    }
+}
+
 void CRRobotRos2::init()
 {
     std::string robotIp{""};
@@ -223,17 +236,16 @@ void CRRobotRos2::init()
     commander_->init();
     kPublisherInfo = this->create_publisher<std_msgs::msg::String>(topicFeedInfo, 10);
     kPublisher200mSDIStatus = this->create_publisher<std_msgs::msg::String>(topic200mSDIStatus, 10);
+    is_running_ = true;
     threadPubFeedBackInfo = std::thread(&CRRobotRos2::pubFeedBackInfo, this);
-    threadPubFeedBackInfo.detach();
     threadPub200mSDIStatus = std::thread(&CRRobotRos2::pub200mSDIStatus, this, robotIp);
-    threadPub200mSDIStatus.detach();
 }
 
 void CRRobotRos2::pub200mSDIStatus(const std::string robotIp)
 {
     rclcpp::Rate reconnectRate(1);
 
-    while (rclcpp::ok())
+    while (is_running_ && rclcpp::ok())
     {
         TcpClient slowFeedbackTcp(robotIp, 30005);
 
@@ -245,7 +257,7 @@ void CRRobotRos2::pub200mSDIStatus(const std::string robotIp)
                 "Publishing 200 ms DI status from %s:30005 on /dobot_bringup_ros2/DIStatus_200mS",
                 robotIp.c_str());
 
-            while (rclcpp::ok() && slowFeedbackTcp.isConnect())
+            while (is_running_ && rclcpp::ok() && slowFeedbackTcp.isConnect())
             {
                 RealTimeData slowFeedbackData{};
                 uint32_t hasRead = 0;
@@ -291,7 +303,10 @@ void CRRobotRos2::pub200mSDIStatus(const std::string robotIp)
         }
 
         slowFeedbackTcp.close();
-        reconnectRate.sleep();
+        if (is_running_ && rclcpp::ok())
+        {
+            reconnectRate.sleep();
+        }
     }
 }
 
@@ -302,7 +317,7 @@ void CRRobotRos2::pubFeedBackInfo()
     // 设置发布频率为100Hz
     rclcpp::Rate rate(100);
 
-    while (rclcpp::ok())
+    while (is_running_ && rclcpp::ok())
     {
         realTimeData = commander_->getRealData();
         nlohmann::json root;

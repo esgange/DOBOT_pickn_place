@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import signal
@@ -18,6 +19,20 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profi
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
+
+
+PR_SET_PDEATHSIG = 1
+try:
+    _LIBC = ctypes.CDLL(None)
+except Exception:  # pragma: no cover - platform fallback
+    _LIBC = None
+
+
+def _camera_child_preexec() -> None:
+    if _LIBC is not None and hasattr(_LIBC, 'prctl'):
+        _LIBC.prctl(PR_SET_PDEATHSIG, int(signal.SIGTERM))
+    if os.getppid() == 1:
+        os.kill(os.getpid(), signal.SIGTERM)
 
 
 @dataclass
@@ -332,11 +347,16 @@ class CameraWatchdog(Node):
                 ],
             ]
             try:
+                popen_kwargs = {
+                    'cwd': str(self._workspace_root),
+                    'env': os.environ.copy(),
+                }
+                if hasattr(os, 'setsid'):
+                    popen_kwargs['start_new_session'] = True
+                    popen_kwargs['preexec_fn'] = _camera_child_preexec
                 process = subprocess.Popen(
                     command,
-                    cwd=str(self._workspace_root),
-                    env=os.environ.copy(),
-                    start_new_session=hasattr(os, 'setsid'),
+                    **popen_kwargs,
                 )
             except Exception as exc:  # noqa: BLE001
                 self._mark_failed_locked(state, f'Failed to start camera launch: {exc}', now)

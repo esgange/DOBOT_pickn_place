@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import copy
 import datetime as _dt
 import os
 import re
@@ -6,7 +7,7 @@ import shutil
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -15,12 +16,15 @@ import numpy as np
 import rclpy
 import torch
 import yaml
+from rclpy.duration import Duration
 from dobot_msgs_v4.srv import GetAngle
 from orbbec_camera_msgs.srv import SetInt32
 from cv_bridge import CvBridge
+from geometry_msgs.msg import TransformStamped
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo, Image
 from std_srvs.srv import SetBool
+from tf2_ros import Buffer, StaticTransformBroadcaster, TransformListener
 
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -94,6 +98,18 @@ DEFAULT_RECORD_FPS = 5.0
 VIDEO_FILE_SUFFIXES = {".avi", ".mp4", ".mov", ".mkv", ".mpeg", ".mpg", ".m4v"}
 IMAGE_FILE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 RAW_CAPTURE_SUFFIX = "_raw"
+ROI_CAPTURE_MANIFEST_NAME = "roi_captures.yaml"
+GET_ANGLE_REASON_ITEM_SETUP = "item setup"
+GET_ANGLE_REASON_SESSION_LOAD = "loaded teach"
+ALLOWED_TEACH_JOINT_SNAPSHOT_REASONS = {
+    GET_ANGLE_REASON_ITEM_SETUP,
+    GET_ANGLE_REASON_SESSION_LOAD,
+}
+GET_ANGLE_NO_RESPONSE_STATUS = (
+    "No GetAngle service response from robot; continuing without updating teach position"
+)
+GET_ANGLE_RESPONSE_TIMEOUT_SEC = 5.0
+SHARED_ROBOT_IP_ADDRESS = "192.168.200.1"
 
 
 @dataclass
@@ -103,7 +119,9 @@ class BinEntry:
     bin_name: str
     teach_date: str
     roi_points: List[Tuple[float, float]]
-    depth_plane: Dict[str, float]
+    platform_roi_frame: str = ""
+    platform_roi_corners: List[Tuple[float, float, float]] = field(default_factory=list)
+    roi_points_source: str = "platform_roi_corners"
 
 
 @dataclass
@@ -151,12 +169,86 @@ def compact_date_for_path() -> str:
     return _dt.datetime.now().strftime("%d%m%Y")
 
 
+def iso_date_for_path() -> str:
+    return _dt.datetime.now().strftime("%Y-%m-%d")
+
+
+SUPPORTED_PACKAGE_YOLO_VERSIONS = ("yolo11", "yolo26")
+
+
 def as_bool(value) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "yes", "on")
     return bool(value)
+
+
+def station_config_value(*keys: str) -> str:
+    path = workspace_path("station_config")
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    values: Dict[str, str] = {}
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        values[key.strip()] = value.strip()
+    for key in keys:
+        value = values.get(key, "")
+        if value:
+            return value
+    return ""
+
+
+def resolve_robot_ip_address(value: object = "") -> str:
+    requested = str(value or "").strip()
+    if requested:
+        return requested
+    env_ip = os.environ.get("ROBOT_IP_ADDRESS", "").strip()
+    if env_ip:
+        return env_ip
+    return station_config_value("ROBOT_IP_ADDRESS", "ip_address")
+
+
+def calibration_matches_robot_ip(path: Path, robot_ip_address: str) -> bool:
+    robot_ip = str(robot_ip_address or "").strip()
+    return bool(robot_ip) and path.stem.endswith(f"_{robot_ip}")
+
+
+def find_latest_robot_calibration(
+    calibration_dir: Path,
+    filename_prefix: str,
+    robot_ip_address: str,
+) -> Optional[Path]:
+    robot_ip = str(robot_ip_address or "").strip()
+    if not robot_ip or robot_ip == SHARED_ROBOT_IP_ADDRESS:
+        return None
+    try:
+        candidates = [
+            path
+            for path in calibration_dir.glob(f"{filename_prefix}*.yaml")
+            if path.is_file() and path.stat().st_size > 0 and calibration_matches_robot_ip(path, robot_ip)
+        ]
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def normalize_calibration_type(value: object) -> str:
+    return str(value or "").strip().lower().replace("-", "_")
 
 
 def normalize_service_root(root: object, fallback: str = "/dobot_bringup_ros2/srv") -> str:
@@ -225,6 +317,31 @@ def polygon_area(points: np.ndarray) -> float:
     return float(abs(cv2.contourArea(points.reshape(-1, 1, 2).astype(np.float32))))
 
 
+def detect_yolo_version_in_text(value: object) -> Optional[str]:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    match = re.search(r"yolo\s*v?[\s_-]*(\d+)", text)
+    if match:
+        version = f"yolo{match.group(1)}"
+        if version in SUPPORTED_PACKAGE_YOLO_VERSIONS:
+            return version
+    for token in re.findall(r"[a-z]+|\d+", text):
+        if token in ("11", "26"):
+            version = f"yolo{token}"
+            if version in SUPPORTED_PACKAGE_YOLO_VERSIONS:
+                return version
+    return None
+
+
+def normalize_package_yolo_version(value: object, fallback: str = "yolo26") -> str:
+    version = detect_yolo_version_in_text(value)
+    if version in SUPPORTED_PACKAGE_YOLO_VERSIONS:
+        return version
+    fallback_version = detect_yolo_version_in_text(fallback)
+    return fallback_version if fallback_version in SUPPORTED_PACKAGE_YOLO_VERSIONS else "yolo26"
+
+
 class ItemTeachYoloNode(Node):
     def __init__(self) -> None:
         super().__init__("item_teach_yolo")
@@ -273,6 +390,30 @@ class ItemTeachYoloNode(Node):
         self.overlay_topic = self.declare_parameter("overlay_topic", "bin_overlay").value
         self.camera_control_service_root = self.normalize_camera_control_service_root(
             self.declare_parameter("camera_control_service_root", BIN_CAMERA_CONTROL_SERVICE_ROOT).value)
+        self.calibration_dir = resolve_path(
+            self.declare_parameter(
+                "calibration_dir",
+                str(workspace_path("calibration")),
+            ).value)
+        self.robot_ip_address = resolve_robot_ip_address(
+            self.declare_parameter("robot_ip_address", "").value)
+        self.eye_to_hand_calibration_file = str(
+            self.declare_parameter("calibration_file", "").value or "").strip()
+        self.platform_calibration_file = str(
+            self.declare_parameter("platform_calibration_file", "").value or "").strip()
+        self.publish_static_calibration_tfs = as_bool(
+            self.declare_parameter("publish_static_calibration_tfs", True).value)
+        self.projection_camera_frame = str(
+            self.declare_parameter("projection_camera_frame", "bin_calibrated_camera_link").value or ""
+        ).strip().strip("/")
+        self.calibration_parent_frame = "base_link"
+        self.calibration_child_frame = "bin_calibrated_camera_link"
+        self.calibration_translation = (0.0, 0.0, 0.0)
+        self.calibration_rotation = (0.0, 0.0, 0.0, 1.0)
+        self.platform_parent_frame = "base_link"
+        self.platform_frame = "platform_reference"
+        self.platform_translation = (0.0, 0.0, 0.0)
+        self.platform_rotation = (0.0, 0.0, 0.0, 1.0)
         color_exposure_percent = clamp_exposure_percent(
             int(self.declare_parameter("color_exposure_percent", 0).value))
         depth_exposure_percent = clamp_exposure_percent(
@@ -334,11 +475,19 @@ class ItemTeachYoloNode(Node):
 
         self.lock = threading.Lock()
         self.latest_bgr: Optional[np.ndarray] = None
+        self.latest_camera_info: Optional[CameraInfo] = None
         self.latest_header_stamp = ""
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.static_tf_broadcaster = StaticTransformBroadcaster(self)
+        self.load_and_publish_station_calibration_tfs()
         self.latest_joint_positions_deg = [0.0] * 6
         self.has_joint_positions = False
         self.teach_joints_source = ""
         self.get_angle_request_in_flight = False
+        self.get_angle_request_started_monotonic = 0.0
+        self.get_angle_request_seq = 0
+        self.active_get_angle_request_seq = 0
         self.pending_teach_joint_snapshot_reason = ""
         self.pending_teach_joint_snapshot_save = False
         self.pending_teach_joint_snapshot_update_profile = False
@@ -377,10 +526,11 @@ class ItemTeachYoloNode(Node):
         self.training_epoch_total = max(1, self.train_epochs)
         self.training_progress = 0.0
         self.trained_model_path = ""
-        self.trained_onnx_path = ""
         self.train_device_used = "cpu"
         self.final_model_dir = ""
         self.latest_profile_path = ""
+        self.package_model_path: Optional[Path] = None
+        self.package_yolo_version = "yolo26"
         self.video_recordings: List[VideoRecordingEntry] = []
         self.roi_image_capture_count = 0
         self.recording_active = False
@@ -433,9 +583,10 @@ class ItemTeachYoloNode(Node):
 
         self.get_angle_client = self.create_client(GetAngle, self.get_angle_service_name)
         self.color_sub = self.create_subscription(Image, self.color_topic, self.color_callback, 10)
+        self.camera_info_sub = self.create_subscription(
+            CameraInfo, self.camera_info_topic, self.camera_info_callback, 10)
         self.teach_joint_snapshot_timer = self.create_timer(
             0.5, self.try_pending_teach_joint_snapshot)
-        self.request_teach_joint_snapshot("node start")
         self.create_camera_exposure_clients()
         self.camera_exposure_timer = self.create_timer(
             0.2, self.apply_pending_camera_exposure_settings)
@@ -710,6 +861,144 @@ class ItemTeachYoloNode(Node):
         except Exception as exc:
             self.get_logger().warn(f"Could not clear YOLO teach runtime folder {self.runtime_root}: {exc}")
 
+    def migrate_legacy_videos_dir(self) -> None:
+        legacy_dir = self.session_dir / "videos"
+        capture_dir = self.session_dir / "images"
+        if not legacy_dir.exists() or legacy_dir == capture_dir:
+            return
+        try:
+            if not capture_dir.exists():
+                legacy_dir.rename(capture_dir)
+                return
+            capture_dir.mkdir(parents=True, exist_ok=True)
+            for child in legacy_dir.iterdir():
+                target = capture_dir / child.name
+                if target.exists():
+                    if child.is_file() and target.is_file() and child.stat().st_size == target.stat().st_size:
+                        child.unlink()
+                        continue
+                    suffix = 1
+                    while target.exists():
+                        target = capture_dir / f"{child.stem}_legacy_{suffix}{child.suffix}"
+                        suffix += 1
+                shutil.move(str(child), str(target))
+            legacy_dir.rmdir()
+        except Exception as exc:
+            self.get_logger().warn(f"Could not migrate legacy ROI image folder {legacy_dir}: {exc}")
+
+    def capture_manifest_path(self) -> Path:
+        return self.capture_images_dir / ROI_CAPTURE_MANIFEST_NAME
+
+    def normalize_capture_manifest(self, root: Optional[Dict] = None) -> Dict:
+        root = root if isinstance(root, dict) else {}
+        recording = root.setdefault("recording", {})
+        if not isinstance(recording, dict):
+            recording = {}
+            root["recording"] = recording
+        frames = recording.get("frames", [])
+        if not isinstance(frames, list):
+            frames = []
+        normalized_frames = []
+        seen_files = set()
+        for frame in frames:
+            if not isinstance(frame, dict):
+                continue
+            file_text = str(frame.get("file", "")).strip()
+            if not file_text or file_text in seen_files:
+                continue
+            seen_files.add(file_text)
+            normalized_frames.append(frame)
+        for index, frame in enumerate(normalized_frames, start=1):
+            frame["index"] = index
+            frame.setdefault("status", "pending")
+        now_text = _dt.datetime.now().isoformat(timespec="seconds")
+        if not str(recording.get("name", "")).strip():
+            recording["name"] = self.capture_manifest_path().with_suffix("").name
+        if not str(recording.get("created_at", "")).strip():
+            recording["created_at"] = now_text
+        recording["ended_at"] = recording.get("ended_at", "")
+        recording.setdefault("frame_source", "raw_camera_full_roi_masked")
+        recording.setdefault("mask_mode", "outside_roi_black")
+        recording["frames"] = normalized_frames
+        recording["frame_count"] = len(normalized_frames)
+        return root
+
+    def read_capture_manifest(self) -> Dict:
+        path = self.capture_manifest_path()
+        if not path.exists():
+            return self.normalize_capture_manifest()
+        try:
+            root = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            return self.normalize_capture_manifest(root if isinstance(root, dict) else {})
+        except Exception as exc:
+            self.get_logger().warn(f"Could not read ROI capture manifest {path}: {exc}")
+            return self.normalize_capture_manifest()
+
+    def write_capture_manifest(self, root: Dict) -> None:
+        path = self.capture_manifest_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        root = self.normalize_capture_manifest(root)
+        tmp_path = path.with_suffix(".tmp")
+        tmp_path.write_text(yaml.safe_dump(root, sort_keys=False), encoding="utf-8")
+        tmp_path.replace(path)
+
+    def capture_manifest_file_names(self) -> set:
+        root = self.read_capture_manifest()
+        frames = root.get("recording", {}).get("frames", [])
+        if not isinstance(frames, list):
+            return set()
+        return {
+            str(frame.get("file", "")).strip()
+            for frame in frames
+            if isinstance(frame, dict) and str(frame.get("file", "")).strip()
+        }
+
+    def migrate_legacy_capture_sidecars(self) -> None:
+        manifest_path = self.capture_manifest_path()
+        root = self.read_capture_manifest()
+        recording = root.setdefault("recording", {})
+        frames = recording.setdefault("frames", [])
+        if not isinstance(frames, list):
+            frames = []
+            recording["frames"] = frames
+        known_files = {
+            str(frame.get("file", "")).strip()
+            for frame in frames
+            if isinstance(frame, dict) and str(frame.get("file", "")).strip()
+        }
+        migrated = False
+        for metadata_path in sorted(self.capture_images_dir.glob("roi_*.yaml")):
+            if metadata_path.name == ROI_CAPTURE_MANIFEST_NAME or not metadata_path.is_file():
+                continue
+            image_path = metadata_path.with_suffix(".png")
+            try:
+                source_root = yaml.safe_load(metadata_path.read_text(encoding="utf-8")) or {}
+                source_recording = source_root.get("recording", {}) if isinstance(source_root, dict) else {}
+                source_frames = source_recording.get("frames", []) if isinstance(source_recording, dict) else []
+                if isinstance(source_frames, list) and source_frames and isinstance(source_frames[0], dict):
+                    frame = dict(source_frames[0])
+                else:
+                    frame = {}
+                file_text = str(frame.get("file", "")).strip() or image_path.name
+                if file_text not in known_files:
+                    frame["file"] = file_text
+                    frame.setdefault("frame_view", "full_roi_masked")
+                    frame.setdefault("status", "pending")
+                    for key in ("captured_at", "width", "height", "roi_crop_rect", "source_roi_crop_rect"):
+                        if key not in frame and isinstance(source_recording, dict) and key in source_recording:
+                            frame[key] = source_recording[key]
+                    frames.append(frame)
+                    known_files.add(file_text)
+                    migrated = True
+                metadata_path.unlink()
+            except Exception as exc:
+                self.get_logger().warn(f"Could not migrate ROI capture sidecar {metadata_path}: {exc}")
+        if migrated or manifest_path.exists():
+            try:
+                self.write_capture_manifest(root)
+            except Exception as exc:
+                self.get_logger().warn(f"Could not write ROI capture manifest {manifest_path}: {exc}")
+
     def configure_session_storage(self) -> None:
         self.dataset_dir = self.session_dir / "dataset"
         self.images_dir = self.dataset_dir / "images" / "train"
@@ -718,7 +1007,10 @@ class ItemTeachYoloNode(Node):
         self.previews_dir = self.session_dir / "previews"
         self.prompts_dir = self.session_dir / "prompts"
         self.models_dir = self.session_dir / "models"
-        self.videos_dir = self.session_dir / "videos"
+        self.capture_images_dir = self.session_dir / "images"
+        self.migrate_legacy_videos_dir()
+        self.capture_images_dir.mkdir(parents=True, exist_ok=True)
+        self.migrate_legacy_capture_sidecars()
         for path in [
             self.images_dir,
             self.labels_dir,
@@ -726,7 +1018,7 @@ class ItemTeachYoloNode(Node):
             self.previews_dir,
             self.prompts_dir,
             self.models_dir,
-            self.videos_dir,
+            self.capture_images_dir,
         ]:
             path.mkdir(parents=True, exist_ok=True)
 
@@ -757,7 +1049,6 @@ class ItemTeachYoloNode(Node):
         self.training_epoch_total = max(1, self.train_epochs)
         self.training_progress = 0.0
         self.trained_model_path = ""
-        self.trained_onnx_path = ""
         self.final_model_dir = ""
         self.latest_profile_path = ""
         self.reset_video_review_state(clear_prompts=False)
@@ -767,7 +1058,7 @@ class ItemTeachYoloNode(Node):
         self.write_dataset_yaml()
         self.status = f"Item name changed to {self.item_name}; new session created"
         self.save_session()
-        self.request_teach_joint_snapshot("new item teach")
+        self.request_teach_joint_snapshot_for_item_setup()
 
     def write_dataset_yaml(self) -> None:
         class_name = self.item_name.strip() if self.has_item_name() else "unnamed_item"
@@ -807,12 +1098,13 @@ class ItemTeachYoloNode(Node):
                 "training_epoch_total": self.training_epoch_total,
                 "training_progress": round(float(self.training_progress), 4),
                 "trained_model_path": self.trained_model_path,
-                "trained_onnx_path": self.trained_onnx_path,
                 "train_device": self.train_device,
                 "train_use_gpu_if_available": self.train_use_gpu_if_available,
                 "train_device_used": self.train_device_used,
                 "final_model_dir": self.final_model_dir,
                 "latest_profile_path": self.latest_profile_path,
+                "package_model_path": str(self.package_model_path) if self.package_model_path else "",
+                "package_yolo_version": self.package_yolo_version,
                 "record_fps": self.record_fps,
                 "video_recording_count": len(self.video_recordings),
                 "recording_active": self.recording_active,
@@ -860,90 +1152,133 @@ class ItemTeachYoloNode(Node):
         save_on_success: bool = True,
         update_profile_on_success: bool = True,
     ) -> None:
+        reason = reason or "teach"
+        if reason not in ALLOWED_TEACH_JOINT_SNAPSHOT_REASONS:
+            self.get_logger().warn(f"Ignoring GetAngle request outside allowed YOLO teach flow: {reason}")
+            return
         self.pending_teach_joint_snapshot_reason = reason or "teach"
         self.pending_teach_joint_snapshot_save = (
             self.pending_teach_joint_snapshot_save or save_on_success)
         self.pending_teach_joint_snapshot_update_profile = (
             self.pending_teach_joint_snapshot_update_profile or update_profile_on_success)
+        self.get_angle_warning_logged = False
         self.try_pending_teach_joint_snapshot()
 
+    def request_teach_joint_snapshot_for_item_setup(self) -> None:
+        if not self.has_item_name() or self.active_bin is None:
+            return
+        self.request_teach_joint_snapshot(GET_ANGLE_REASON_ITEM_SETUP)
+
+    def clear_pending_teach_joint_snapshot(self) -> None:
+        self.pending_teach_joint_snapshot_reason = ""
+        self.pending_teach_joint_snapshot_save = False
+        self.pending_teach_joint_snapshot_update_profile = False
+
+    def prompt_get_angle_no_response(self, reason: str, detail: str) -> None:
+        if not self.get_angle_warning_logged:
+            self.get_logger().warn(f"{detail}; {GET_ANGLE_NO_RESPONSE_STATUS}")
+            self.get_angle_warning_logged = True
+        self.status = GET_ANGLE_NO_RESPONSE_STATUS
+
+    def check_teach_joint_snapshot_timeout(self) -> None:
+        if not self.get_angle_request_in_flight:
+            return
+        elapsed_sec = time.monotonic() - self.get_angle_request_started_monotonic
+        if elapsed_sec < GET_ANGLE_RESPONSE_TIMEOUT_SEC:
+            return
+        self.get_angle_request_in_flight = False
+        self.active_get_angle_request_seq = 0
+        self.get_angle_request_started_monotonic = 0.0
+        self.prompt_get_angle_no_response(
+            "",
+            f"GetAngle did not respond within {GET_ANGLE_RESPONSE_TIMEOUT_SEC:.1f}s",
+        )
+
     def try_pending_teach_joint_snapshot(self) -> None:
+        if self.get_angle_request_in_flight:
+            self.check_teach_joint_snapshot_timeout()
         if not self.pending_teach_joint_snapshot_reason or self.get_angle_request_in_flight:
             return
         if not hasattr(self, "get_angle_client") or self.get_angle_client is None:
+            reason = self.pending_teach_joint_snapshot_reason
+            self.clear_pending_teach_joint_snapshot()
+            self.prompt_get_angle_no_response(reason, "GetAngle client is not available")
             return
         if not self.get_angle_client.service_is_ready():
-            if not self.get_angle_warning_logged:
-                self.get_logger().warn(
-                    f"Robot joint snapshot service not available: {self.get_angle_service_name}")
-                self.get_angle_warning_logged = True
+            reason = self.pending_teach_joint_snapshot_reason
+            self.clear_pending_teach_joint_snapshot()
+            self.prompt_get_angle_no_response(
+                reason,
+                f"GetAngle service is not ready: {self.get_angle_service_name}",
+            )
             return
 
         reason = self.pending_teach_joint_snapshot_reason
         save_on_success = self.pending_teach_joint_snapshot_save
         update_profile_on_success = self.pending_teach_joint_snapshot_update_profile
-        self.pending_teach_joint_snapshot_reason = ""
-        self.pending_teach_joint_snapshot_save = False
-        self.pending_teach_joint_snapshot_update_profile = False
+        self.clear_pending_teach_joint_snapshot()
         self.get_angle_request_in_flight = True
-        future = self.get_angle_client.call_async(GetAngle.Request())
+        self.get_angle_request_seq += 1
+        request_seq = self.get_angle_request_seq
+        self.active_get_angle_request_seq = request_seq
+        self.get_angle_request_started_monotonic = time.monotonic()
+        try:
+            future = self.get_angle_client.call_async(GetAngle.Request())
+        except Exception as exc:
+            self.get_angle_request_in_flight = False
+            self.active_get_angle_request_seq = 0
+            self.get_angle_request_started_monotonic = 0.0
+            self.prompt_get_angle_no_response(reason, f"GetAngle call could not be sent: {exc}")
+            return
         future.add_done_callback(
             lambda done_future: self.handle_teach_joint_snapshot_response(
                 done_future,
+                request_seq,
                 reason,
                 save_on_success,
                 update_profile_on_success,
             )
         )
 
-    def requeue_teach_joint_snapshot(
-        self,
-        reason: str,
-        save_on_success: bool,
-        update_profile_on_success: bool,
-    ) -> None:
-        self.pending_teach_joint_snapshot_reason = reason or "teach"
-        self.pending_teach_joint_snapshot_save = (
-            self.pending_teach_joint_snapshot_save or save_on_success)
-        self.pending_teach_joint_snapshot_update_profile = (
-            self.pending_teach_joint_snapshot_update_profile or update_profile_on_success)
-
     def handle_teach_joint_snapshot_response(
         self,
         future,
+        request_seq: int,
         reason: str,
         save_on_success: bool,
         update_profile_on_success: bool,
     ) -> None:
+        if request_seq != self.active_get_angle_request_seq:
+            return
         self.get_angle_request_in_flight = False
+        self.active_get_angle_request_seq = 0
+        self.get_angle_request_started_monotonic = 0.0
         try:
             response = future.result()
         except Exception as exc:
-            if not self.get_angle_warning_logged:
-                self.get_logger().warn(f"GetAngle call failed while saving teach joints: {exc}")
-                self.get_angle_warning_logged = True
-            self.requeue_teach_joint_snapshot(reason, save_on_success, update_profile_on_success)
+            self.prompt_get_angle_no_response(
+                reason,
+                f"GetAngle call failed while saving teach joints: {exc}",
+            )
             return
 
         if response is None or int(getattr(response, "res", -1)) < 0:
-            if not self.get_angle_warning_logged:
-                self.get_logger().warn(
-                    "GetAngle failed while saving teach joints: "
-                    f"res={getattr(response, 'res', None)}, "
-                    f"return={getattr(response, 'robot_return', '')}")
-                self.get_angle_warning_logged = True
-            self.requeue_teach_joint_snapshot(reason, save_on_success, update_profile_on_success)
+            self.prompt_get_angle_no_response(
+                reason,
+                "GetAngle failed while saving teach joints: "
+                f"res={getattr(response, 'res', None)}, "
+                f"return={getattr(response, 'robot_return', '')}",
+            )
             return
 
         joints_deg = self.parse_six_values_from_robot_return(
             getattr(response, "robot_return", ""))
         if joints_deg is None:
-            if not self.get_angle_warning_logged:
-                self.get_logger().warn(
-                    "Could not parse GetAngle reply while saving teach joints: "
-                    f"{getattr(response, 'robot_return', '')}")
-                self.get_angle_warning_logged = True
-            self.requeue_teach_joint_snapshot(reason, save_on_success, update_profile_on_success)
+            self.prompt_get_angle_no_response(
+                reason,
+                "Could not parse GetAngle reply while saving teach joints: "
+                f"{getattr(response, 'robot_return', '')}",
+            )
             return
 
         self.latest_joint_positions_deg = [float(value) for value in joints_deg]
@@ -961,8 +1296,7 @@ class ItemTeachYoloNode(Node):
                 self.write_profile()
             except Exception as exc:
                 self.get_logger().warn(f"Could not update YOLO teach profile joints: {exc}")
-        if reason != "node start":
-            self.status = f"Teach position saved from robot: {reason}"
+        self.status = f"Teach position saved from robot: {reason}"
 
     @staticmethod
     def parse_six_values_from_robot_return(
@@ -1026,13 +1360,72 @@ class ItemTeachYoloNode(Node):
         base_stem = stem[:-len(RAW_CAPTURE_SUFFIX)]
         return image_path.with_name(base_stem).with_suffix(".yaml")
 
+    def capture_manifest_frame_for_image(self, image_path: Path) -> Tuple[Optional[Dict], Dict]:
+        try:
+            manifest_path = self.capture_manifest_path().resolve()
+            if image_path.resolve().parent != manifest_path.parent:
+                return None, {}
+            root = self.read_capture_manifest()
+            recording = root.get("recording", {})
+            frames = recording.get("frames", []) if isinstance(recording, dict) else []
+            if not isinstance(frames, list):
+                return None, recording if isinstance(recording, dict) else {}
+            image_name = image_path.name
+            for frame in frames:
+                if not isinstance(frame, dict):
+                    continue
+                file_text = str(frame.get("file", "")).strip()
+                if Path(file_text).name == image_name:
+                    return frame, recording if isinstance(recording, dict) else {}
+        except Exception as exc:
+            self.get_logger().warn(f"Could not read ROI capture manifest for {image_path}: {exc}")
+        return None, {}
+
+    def apply_source_frame_metadata(
+        self,
+        frame_record: Dict,
+        source_frame: Dict,
+        recording: Dict,
+        image_path: Path,
+        is_raw_capture: bool,
+    ) -> None:
+        frame_rect = source_frame.get("roi_crop_rect", [])
+        source_rect = source_frame.get("source_roi_crop_rect", recording.get("source_roi_crop_rect", []))
+        roi_rect = source_rect if is_raw_capture and isinstance(source_rect, list) else frame_rect
+        if isinstance(roi_rect, list):
+            frame_record["roi_crop_rect"] = list(roi_rect[:4])
+        frame_view = str(source_frame.get("frame_view", "")).strip()
+        if frame_view:
+            frame_record["frame_view"] = frame_view
+        if is_raw_capture:
+            frame_record["frame_view"] = "full_raw"
+        raw_file = str(source_frame.get("raw_file", "")).strip()
+        if raw_file:
+            raw_path = Path(raw_file)
+            if not raw_path.is_absolute():
+                raw_path = image_path.parent / raw_path
+            frame_record["raw_file"] = str(raw_path)
+        if isinstance(source_rect, list):
+            frame_record["source_roi_crop_rect"] = list(source_rect[:4])
+        for key in (
+            "status",
+            "updated_at",
+            "sample_stem",
+            "sample_stems",
+            "sample_count",
+        ):
+            if key in source_frame:
+                frame_record[key] = source_frame[key]
+
     def review_frame_uses_roi_rect(self, frame_view: str) -> bool:
         return frame_view in {"full_roi_masked", "full_raw", "full_camera_raw"}
 
     def recording_is_roi_image_capture(self, recording_path: Path, recording: Dict) -> bool:
+        if recording_path.with_suffix("").name == self.capture_manifest_path().with_suffix("").name:
+            return True
         if not recording_path.name.startswith("roi_"):
             return False
-        if not str(recording.get("image_file", "")).strip():
+        if not str(recording.get("image_file", "")).strip() and not recording.get("frames"):
             return False
         frame_source = str(recording.get("frame_source", "")).strip()
         if frame_source in {"selected_image", "image_folder"}:
@@ -1200,11 +1593,12 @@ class ItemTeachYoloNode(Node):
             recording["frame_count"] = frame_count
         return self.normalize_recording_metadata(recording_path, {"recording": recording})
 
-    def recording_refs_in_videos_dir(self) -> List[Path]:
+    def recording_refs_in_capture_images_dir(self) -> List[Path]:
         refs: Dict[str, Path] = {}
         try:
-            self.videos_dir.mkdir(parents=True, exist_ok=True)
-            for path in self.videos_dir.iterdir():
+            self.capture_images_dir.mkdir(parents=True, exist_ok=True)
+            manifest_file_names = self.capture_manifest_file_names()
+            for path in self.capture_images_dir.iterdir():
                 if path.is_dir():
                     refs[str(path.resolve())] = path
                     continue
@@ -1219,6 +1613,8 @@ class ItemTeachYoloNode(Node):
                 elif suffix in IMAGE_FILE_SUFFIXES:
                     if self.is_raw_capture_image(path):
                         continue
+                    if path.name in manifest_file_names:
+                        continue
                     refs[str(path.with_suffix("").resolve())] = path.with_suffix("")
         except Exception as exc:
             self.get_logger().warn(f"Could not list ROI recordings: {exc}")
@@ -1228,7 +1624,7 @@ class ItemTeachYoloNode(Node):
         entries: List[VideoRecordingEntry] = []
         capture_count = 0
         try:
-            for path in self.recording_refs_in_videos_dir():
+            for path in self.recording_refs_in_capture_images_dir():
                 try:
                     root = self.read_recording_metadata(path)
                     recording = root.get("recording", {})
@@ -1259,7 +1655,7 @@ class ItemTeachYoloNode(Node):
                     )
                     if frame_count > 0:
                         if self.recording_is_roi_image_capture(path, recording):
-                            capture_count += 1
+                            capture_count += max(1, frame_count)
                         entries.append(VideoRecordingEntry(
                             label=label,
                             path=path,
@@ -1387,7 +1783,7 @@ class ItemTeachYoloNode(Node):
         return self.review_mode
 
     def select_review_image_path(self) -> Optional[Path]:
-        initial_dir = self.videos_dir if self.videos_dir.exists() else self.session_dir
+        initial_dir = self.capture_images_dir if self.capture_images_dir.exists() else self.session_dir
         try:
             import tkinter as tk
             from tkinter import filedialog
@@ -1450,7 +1846,7 @@ class ItemTeachYoloNode(Node):
         return None
 
     def select_review_image_folder(self) -> Optional[Path]:
-        initial_dir = self.videos_dir if self.videos_dir.exists() else self.session_dir
+        initial_dir = self.capture_images_dir if self.capture_images_dir.exists() else self.session_dir
         try:
             import tkinter as tk
             from tkinter import filedialog
@@ -1523,6 +1919,16 @@ class ItemTeachYoloNode(Node):
             "status": "pending",
             "roi_crop_rect": [],
         }
+        manifest_frame, manifest_recording = self.capture_manifest_frame_for_image(image_path)
+        if isinstance(manifest_frame, dict):
+            self.apply_source_frame_metadata(
+                frame_record,
+                manifest_frame,
+                manifest_recording,
+                image_path,
+                is_raw_capture,
+            )
+            return frame_record
         metadata_path = self.capture_metadata_path_for_image(image_path)
         if metadata_path.exists():
             try:
@@ -1531,33 +1937,13 @@ class ItemTeachYoloNode(Node):
                 frames = recording.get("frames", []) if isinstance(recording, dict) else []
                 if isinstance(frames, list) and frames and isinstance(frames[0], dict):
                     source_frame = frames[0]
-                    frame_rect = source_frame.get("roi_crop_rect", [])
-                    source_rect = source_frame.get("source_roi_crop_rect", recording.get("source_roi_crop_rect", []))
-                    roi_rect = source_rect if is_raw_capture and isinstance(source_rect, list) else frame_rect
-                    if isinstance(roi_rect, list):
-                        frame_record["roi_crop_rect"] = list(roi_rect[:4])
-                    frame_view = str(source_frame.get("frame_view", "")).strip()
-                    if frame_view:
-                        frame_record["frame_view"] = frame_view
-                    if is_raw_capture:
-                        frame_record["frame_view"] = "full_raw"
-                    raw_file = str(source_frame.get("raw_file", "")).strip()
-                    if raw_file:
-                        raw_path = Path(raw_file)
-                        if not raw_path.is_absolute():
-                            raw_path = image_path.parent / raw_path
-                        frame_record["raw_file"] = str(raw_path)
-                    if isinstance(source_rect, list):
-                        frame_record["source_roi_crop_rect"] = list(source_rect[:4])
-                    for key in (
-                        "status",
-                        "updated_at",
-                        "sample_stem",
-                        "sample_stems",
-                        "sample_count",
-                    ):
-                        if key in source_frame:
-                            frame_record[key] = source_frame[key]
+                    self.apply_source_frame_metadata(
+                        frame_record,
+                        source_frame,
+                        recording if isinstance(recording, dict) else {},
+                        image_path,
+                        is_raw_capture,
+                    )
             except Exception as exc:
                 self.get_logger().warn(f"Could not read ROI image metadata {metadata_path}: {exc}")
         return frame_record
@@ -1587,12 +1973,12 @@ class ItemTeachYoloNode(Node):
             self.status = "Selected folder has no readable ROI images"
             return None
 
-        self.videos_dir.mkdir(parents=True, exist_ok=True)
+        self.capture_images_dir.mkdir(parents=True, exist_ok=True)
         folder_token = safe_name(folder_path.name, fallback="images")
-        review_path = self.videos_dir / f"review_{folder_token}_{timestamp_for_path()}"
+        review_path = self.capture_images_dir / f"review_{folder_token}_{timestamp_for_path()}"
         suffix = 1
         while review_path.with_suffix(".yaml").exists() or review_path.exists():
-            review_path = self.videos_dir / f"review_{folder_token}_{timestamp_for_path()}_{suffix}"
+            review_path = self.capture_images_dir / f"review_{folder_token}_{timestamp_for_path()}_{suffix}"
             suffix += 1
 
         now_text = _dt.datetime.now().isoformat(timespec="seconds")
@@ -1621,8 +2007,8 @@ class ItemTeachYoloNode(Node):
     def existing_recording_dir_for_media(self, media_path: Path) -> Optional[Path]:
         try:
             target = media_path.resolve()
-            self.videos_dir.mkdir(parents=True, exist_ok=True)
-            for candidate in self.recording_refs_in_videos_dir():
+            self.capture_images_dir.mkdir(parents=True, exist_ok=True)
+            for candidate in self.recording_refs_in_capture_images_dir():
                 try:
                     root = self.read_recording_metadata(candidate)
                     recording = root.get("recording", {})
@@ -1648,22 +2034,22 @@ class ItemTeachYoloNode(Node):
         if not is_image and not is_video:
             self.status = "Selected file is not a supported image"
             return None
-        self.videos_dir.mkdir(parents=True, exist_ok=True)
+        self.capture_images_dir.mkdir(parents=True, exist_ok=True)
         item_token = safe_name(self.item_name, fallback="item")
         media_token = safe_name(media_path.stem, fallback="image")
         name = f"selected_{item_token}_{media_token}_{timestamp_for_path()}"
-        recording_path = self.videos_dir / name
+        recording_path = self.capture_images_dir / name
         suffix = 1
         while (
             recording_path.exists()
             or recording_path.with_suffix(".yaml").exists()
             or recording_path.with_suffix(media_path.suffix or ".png").exists()
         ):
-            recording_path = self.videos_dir / f"{name}_{suffix}"
+            recording_path = self.capture_images_dir / f"{name}_{suffix}"
             suffix += 1
 
         copied_media = False
-        if media_path.parent.resolve() == self.videos_dir.resolve():
+        if media_path.parent.resolve() == self.capture_images_dir.resolve():
             review_media_path = media_path
             recording_path = media_path.with_suffix("")
         else:
@@ -1777,15 +2163,15 @@ class ItemTeachYoloNode(Node):
             return
         if self.resume_existing_video_review():
             return
-        if self.videos_dir.exists():
+        if self.capture_images_dir.exists():
             has_session_images = any(
                 path.is_file()
                 and path.suffix.lower() in IMAGE_FILE_SUFFIXES
                 and not self.is_raw_capture_image(path)
-                for path in self.videos_dir.iterdir()
+                for path in self.capture_images_dir.iterdir()
             )
             if has_session_images:
-                review_path = self.import_review_folder(self.videos_dir)
+                review_path = self.import_review_folder(self.capture_images_dir)
                 if review_path is not None:
                     self.refresh_video_recordings()
                     review_index = next(
@@ -1819,11 +2205,11 @@ class ItemTeachYoloNode(Node):
         self.enter_video_review(review_index)
 
     def unique_recording_dir(self) -> Path:
-        self.videos_dir.mkdir(parents=True, exist_ok=True)
+        self.capture_images_dir.mkdir(parents=True, exist_ok=True)
         item_token = safe_name(self.item_name, fallback="item")
         bin_token = safe_name(self.active_bin.bin_name, fallback="bin") if self.active_bin else "bin"
         name = f"roi_{item_token}_{bin_token}_{timestamp_for_path()}"
-        path = self.videos_dir / name
+        path = self.capture_images_dir / name
         suffix = 1
         while (
             path.exists()
@@ -1832,7 +2218,7 @@ class ItemTeachYoloNode(Node):
             or path.with_suffix(".avi").exists()
             or path.with_suffix(".yaml").exists()
         ):
-            path = self.videos_dir / f"{name}_{suffix}"
+            path = self.capture_images_dir / f"{name}_{suffix}"
             suffix += 1
         return path
 
@@ -1862,41 +2248,39 @@ class ItemTeachYoloNode(Node):
         capture_path = self.unique_recording_dir()
         image_path = self.default_recording_image_path(capture_path)
         now_text = _dt.datetime.now().isoformat(timespec="seconds")
-        metadata = {
-            "recording": {
-                "name": capture_path.name,
-                "created_at": now_text,
-                "ended_at": now_text,
-                "bin_name": self.active_bin.bin_name if self.active_bin else "",
-                "bin_file": str(self.active_bin.path) if self.active_bin else "",
-                "image_file": image_path.name,
-                "frame_source": "raw_camera_full_roi_masked",
-                "mask_mode": "outside_roi_black",
-                "image_width": int(full_roi_frame.shape[1]),
-                "image_height": int(full_roi_frame.shape[0]),
-                "roi_crop_rect": list(rect),
-                "source_roi_crop_rect": list(rect),
-                "frame_count": 1,
-                "frames": [{
-                    "index": 1,
-                    "file": image_path.name,
-                    "captured_at": _dt.datetime.now().isoformat(timespec="milliseconds"),
-                    "frame_view": "full_roi_masked",
-                    "width": int(full_roi_frame.shape[1]),
-                    "height": int(full_roi_frame.shape[0]),
-                    "status": "pending",
-                    "roi_crop_rect": list(rect),
-                    "source_roi_crop_rect": list(rect),
-                }],
-            }
+        frame_record = {
+            "file": image_path.name,
+            "captured_at": _dt.datetime.now().isoformat(timespec="milliseconds"),
+            "frame_view": "full_roi_masked",
+            "width": int(full_roi_frame.shape[1]),
+            "height": int(full_roi_frame.shape[0]),
+            "status": "pending",
+            "roi_crop_rect": list(rect),
+            "source_roi_crop_rect": list(rect),
         }
         try:
             if not cv2.imwrite(str(image_path), full_roi_frame):
                 raise RuntimeError(f"cv2.imwrite returned false for {image_path}")
-            metadata_path = self.recording_metadata_path(capture_path)
-            tmp_path = metadata_path.with_suffix(".tmp")
-            tmp_path.write_text(yaml.safe_dump(metadata, sort_keys=False), encoding="utf-8")
-            tmp_path.replace(metadata_path)
+            manifest = self.read_capture_manifest()
+            recording = manifest.setdefault("recording", {})
+            frames = recording.setdefault("frames", [])
+            if not isinstance(frames, list):
+                frames = []
+                recording["frames"] = frames
+            if not frames:
+                recording["created_at"] = now_text
+            recording["ended_at"] = now_text
+            recording["bin_name"] = self.active_bin.bin_name if self.active_bin else ""
+            recording["bin_file"] = str(self.active_bin.path) if self.active_bin else ""
+            recording["frame_source"] = "raw_camera_full_roi_masked"
+            recording["mask_mode"] = "outside_roi_black"
+            recording["image_width"] = int(full_roi_frame.shape[1])
+            recording["image_height"] = int(full_roi_frame.shape[0])
+            recording["roi_crop_rect"] = list(rect)
+            recording["source_roi_crop_rect"] = list(rect)
+            frame_record["index"] = len(frames) + 1
+            frames.append(frame_record)
+            self.write_capture_manifest(manifest)
             self.refresh_video_recordings()
             self.status = (
                 f"Captured ROI image {full_roi_frame.shape[1]}x{full_roi_frame.shape[0]}: "
@@ -1905,7 +2289,6 @@ class ItemTeachYoloNode(Node):
             self.save_session()
         except Exception as exc:
             image_path.unlink(missing_ok=True)
-            self.recording_metadata_path(capture_path).unlink(missing_ok=True)
             self.status = f"ROI capture failed: {exc}"
             self.get_logger().warn(self.status)
 
@@ -2217,6 +2600,20 @@ class ItemTeachYoloNode(Node):
         except (TypeError, ValueError):
             return 0
 
+    def review_frame_sample_breakdown(self, frame: Optional[Dict] = None) -> Tuple[int, int, int]:
+        stems = self.review_frame_sample_stems(frame)
+        if not stems:
+            total = self.review_frame_sample_count(frame)
+            return total, 0, total
+        background_count = 0
+        item_count = 0
+        for stem in stems:
+            if stem.startswith("background_"):
+                background_count += 1
+            else:
+                item_count += 1
+        return item_count, background_count, len(stems)
+
     def load_saved_review_mask(self, frame: Dict) -> str:
         if str(frame.get("status", "pending")) != "annotated":
             return ""
@@ -2225,19 +2622,25 @@ class ItemTeachYoloNode(Node):
         stems = self.review_frame_sample_stems(frame)
         if not stems:
             return ""
-        for stem in reversed(stems):
+        crop_h, crop_w = self.frozen_crop_bgr.shape[:2]
+        combined_mask = np.zeros((crop_h, crop_w), dtype=np.uint8)
+        loaded_stems: List[str] = []
+        for stem in stems:
             mask_path = self.masks_dir / f"{stem}.png"
             if not mask_path.exists():
                 continue
             mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
             if mask is None:
                 continue
-            crop_h, crop_w = self.frozen_crop_bgr.shape[:2]
             if mask.shape[:2] != (crop_h, crop_w):
                 mask = cv2.resize(mask, (crop_w, crop_h), interpolation=cv2.INTER_NEAREST)
-            self.current_mask = (mask > 0).astype(np.uint8) * 255
-            return f" | loaded mask {stem}"
-        return f" | {len(stems)} saved sample(s)"
+            combined_mask = cv2.bitwise_or(combined_mask, (mask > 0).astype(np.uint8) * 255)
+            loaded_stems.append(stem)
+        if loaded_stems:
+            self.current_mask = combined_mask
+            return f" | loaded {len(loaded_stems)} saved mask(s)"
+        item_count, background_count, total_count = self.review_frame_sample_breakdown(frame)
+        return f" | saved samples {total_count} item {item_count} BG {background_count}"
 
     def load_review_frame(
         self,
@@ -2323,7 +2726,7 @@ class ItemTeachYoloNode(Node):
         frame_path = self.review_frame_path(frame) if isinstance(frame, dict) else None
         recording_path = self.current_review_recording_path()
         deleted_paths = []
-        if frame_path is not None and self.path_is_inside(frame_path, self.videos_dir):
+        if frame_path is not None and self.path_is_inside(frame_path, self.capture_images_dir):
             candidate_paths = [
                 frame_path,
                 frame_path.with_suffix(".yaml"),
@@ -2342,7 +2745,7 @@ class ItemTeachYoloNode(Node):
                 if str(resolved) in seen_paths:
                     continue
                 seen_paths.add(str(resolved))
-                if not self.path_is_inside(path, self.videos_dir):
+                if not self.path_is_inside(path, self.capture_images_dir):
                     continue
                 try:
                     if path.exists():
@@ -2367,7 +2770,7 @@ class ItemTeachYoloNode(Node):
         else:
             if recording_path is not None:
                 metadata_path = self.recording_metadata_path(recording_path)
-                if self.path_is_inside(metadata_path, self.videos_dir):
+                if self.path_is_inside(metadata_path, self.capture_images_dir):
                     try:
                         if metadata_path.exists():
                             metadata_path.unlink()
@@ -2447,7 +2850,7 @@ class ItemTeachYoloNode(Node):
             self.load_review_frame(
                 self.review_frame_index,
                 clear_prompts=True,
-                restore_saved_annotation=False,
+                restore_saved_annotation=True,
             )
         self.status = status_text
         self.save_session()
@@ -2647,6 +3050,7 @@ class ItemTeachYoloNode(Node):
             else:
                 self.reset_video_review_state(clear_prompts=True)
             self.save_session()
+            self.remove_runtime_dir(old_session_dir)
             self.refresh_saved_sessions()
             self.status = f"Saved session: {target.name}"
         except Exception as exc:
@@ -2716,12 +3120,17 @@ class ItemTeachYoloNode(Node):
             self.training_epoch_total = max(1, int(params.get("training_epoch_total", self.train_epochs)))
             self.training_progress = float(params.get("training_progress", 0.0))
             self.trained_model_path = str(params.get("trained_model_path", ""))
-            self.trained_onnx_path = str(params.get("trained_onnx_path", ""))
             if "train_use_gpu_if_available" in params:
                 self.train_use_gpu_if_available = as_bool(params["train_use_gpu_if_available"])
             self.train_device_used = str(params.get("train_device_used", self.train_device_used))
             self.final_model_dir = str(params.get("final_model_dir", ""))
             self.latest_profile_path = str(params.get("latest_profile_path", ""))
+            package_model_path = str(params.get("package_model_path", "")).strip()
+            self.package_model_path = resolve_path(package_model_path) if package_model_path else None
+            self.package_yolo_version = normalize_package_yolo_version(
+                params.get("package_yolo_version", self.package_yolo_version),
+                self.package_yolo_version,
+            )
             teach_joints = params.get("teach_joints_deg", [])
             if isinstance(teach_joints, list) and len(teach_joints) >= 6:
                 self.latest_joint_positions_deg = [float(value) for value in teach_joints[:6]]
@@ -2753,13 +3162,13 @@ class ItemTeachYoloNode(Node):
                 self.reset_video_review_state(clear_prompts=True)
             self.write_dataset_yaml()
             self.save_session()
-            self.request_teach_joint_snapshot("loaded teach")
             self.refresh_saved_sessions()
             self.load_session_dropdown_open = False
             self.status = (
                 f"Loaded session: {self.item_name or self.session_dir.name} | "
                 f"{self.sample_count_label()} | updating teach position"
                 f"{' | review restored' if review_restored else ''}")
+            self.request_teach_joint_snapshot(GET_ANGLE_REASON_SESSION_LOAD)
         except Exception as exc:
             self.status = f"Load session failed: {exc}"
             self.get_logger().warn(self.status)
@@ -2803,7 +3212,6 @@ class ItemTeachYoloNode(Node):
                 self.training_epoch_total = max(1, self.train_epochs)
                 self.training_progress = 0.0
                 self.trained_model_path = ""
-                self.trained_onnx_path = ""
                 self.train_device_used = "cpu"
                 self.final_model_dir = ""
                 self.latest_profile_path = ""
@@ -2842,20 +3250,15 @@ class ItemTeachYoloNode(Node):
         try:
             root = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
             bin_node = root.get("bin_teach", {})
-            roi_points = parse_flat_points(bin_node.get("roi_points", []))
-            if not roi_points:
+            platform_roi_frame, platform_roi_corners = self.parse_platform_roi_corners(bin_node)
+            if not platform_roi_frame or len(platform_roi_corners) != 4:
+                self.get_logger().warn(
+                    f"Skipping bin teach file {path}: missing platform_roi_corners"
+                )
                 return None
+            projected_roi = self.project_platform_roi_points(platform_roi_frame, platform_roi_corners)
+            roi_points = projected_roi if projected_roi is not None else []
             bin_name = str(bin_node.get("bin_name", path.stem))
-            depth_plane = {}
-            for key in [
-                "depth_plane_enabled",
-                "depth_plane_a",
-                "depth_plane_b",
-                "depth_plane_c",
-                "depth_plane_reference_depth_m",
-            ]:
-                if key in bin_node:
-                    depth_plane[key] = bin_node[key]
             teach_date = str(bin_node.get("teach_date", ""))
             label = bin_name
             if teach_date:
@@ -2868,11 +3271,296 @@ class ItemTeachYoloNode(Node):
                 bin_name=bin_name,
                 teach_date=teach_date,
                 roi_points=roi_points,
-                depth_plane=depth_plane,
+                platform_roi_frame=platform_roi_frame,
+                platform_roi_corners=platform_roi_corners,
+                roi_points_source="platform_roi_corners",
             )
         except Exception as exc:
             self.get_logger().warn(f"Skipping bin teach file {path}: {exc}")
             return None
+
+    def parse_platform_roi_corners(
+        self,
+        bin_node: Dict,
+    ) -> Tuple[str, List[Tuple[float, float, float]]]:
+        root = bin_node.get("platform_roi_corners", {})
+        if not isinstance(root, dict):
+            return "", []
+        frame = str(root.get("coordinate_frame", "")).strip().strip("/")
+        points_node = root.get("points", [])
+        if not frame or not isinstance(points_node, list):
+            return "", []
+        points: List[Tuple[float, float, float]] = []
+        for point_node in points_node:
+            if not isinstance(point_node, dict):
+                continue
+            position = point_node.get("position", {})
+            if not isinstance(position, dict):
+                continue
+            try:
+                point = (
+                    float(position.get("x", 0.0)),
+                    float(position.get("y", 0.0)),
+                    float(position.get("z", 0.0)),
+                )
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(point).all():
+                points.append(point)
+        return (frame, points) if len(points) == 4 else ("", [])
+
+    @staticmethod
+    def rotate_vector_by_quaternion(
+        vector: np.ndarray,
+        quaternion_xyzw: np.ndarray,
+    ) -> np.ndarray:
+        norm = float(np.linalg.norm(quaternion_xyzw))
+        if norm <= 1e-12:
+            return vector
+        q = quaternion_xyzw / norm
+        q_vec = q[:3]
+        t = 2.0 * np.cross(q_vec, vector)
+        return vector + (q[3] * t) + np.cross(q_vec, t)
+
+    @staticmethod
+    def yaml_map(value) -> Dict:
+        return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def parse_transform_values(transform: Dict) -> Tuple[Tuple[float, float, float], Tuple[float, float, float, float]]:
+        translation_node = ItemTeachYoloNode.yaml_map(transform.get("translation", {}))
+        rotation_node = ItemTeachYoloNode.yaml_map(transform.get("rotation", {}))
+        translation = (
+            float(translation_node.get("x", 0.0)),
+            float(translation_node.get("y", 0.0)),
+            float(translation_node.get("z", 0.0)),
+        )
+        qx = float(rotation_node.get("x", 0.0))
+        qy = float(rotation_node.get("y", 0.0))
+        qz = float(rotation_node.get("z", 0.0))
+        qw = float(rotation_node.get("w", 1.0))
+        norm = float(np.linalg.norm(np.array([qx, qy, qz, qw], dtype=np.float64)))
+        if norm <= 1e-12 or not np.isfinite(norm):
+            raise ValueError("invalid quaternion")
+        rotation = (qx / norm, qy / norm, qz / norm, qw / norm)
+        if not np.isfinite([*translation, *rotation]).all():
+            raise ValueError("non-finite transform value")
+        return translation, rotation
+
+    def resolve_calibration_file(self, explicit_file: str, filename_prefix: str, label: str) -> Optional[Path]:
+        if explicit_file:
+            path = resolve_path(explicit_file)
+            if path.exists() and path.is_file() and path.stat().st_size > 0:
+                return path
+            self.get_logger().warn(f"{label} calibration file is set but missing/empty: {path}")
+            return None
+        path = find_latest_robot_calibration(self.calibration_dir, filename_prefix, self.robot_ip_address)
+        if path is None:
+            if self.robot_ip_address:
+                self.get_logger().warn(
+                    f"No {label} calibration YAML tagged for robot IP {self.robot_ip_address} "
+                    f"found in {self.calibration_dir}. Platform ROI projection will wait for calibration.")
+            else:
+                self.get_logger().warn(
+                    f"Robot IP is not resolved; cannot auto-select {label} calibration. "
+                    "Platform ROI projection will wait for calibration.")
+        return path
+
+    def load_eye_to_hand_calibration(self, path: Path) -> bool:
+        try:
+            root = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            params = self.yaml_map(root.get("parameters", {}))
+            if normalize_calibration_type(params.get("calibration_type", "")) != "eye_on_base":
+                raise ValueError("expected parameters.calibration_type=eye_on_base")
+            transform = self.yaml_map(root.get("transform", {}))
+            translation, rotation = self.parse_transform_values(transform)
+            parent = str(
+                params.get("transform_parent_frame") or
+                params.get("robot_base_frame") or
+                self.calibration_parent_frame
+            ).strip().strip("/")
+            child = str(params.get("transform_child_frame") or self.calibration_child_frame).strip().strip("/")
+            if not parent or not child:
+                raise ValueError("missing transform parent/child frame")
+            self.calibration_parent_frame = parent
+            self.calibration_child_frame = child
+            self.calibration_translation = translation
+            self.calibration_rotation = rotation
+            self.eye_to_hand_calibration_file = str(path)
+            return True
+        except Exception as exc:
+            self.get_logger().warn(f"Failed to load eye-to-hand calibration {path}: {exc}")
+            return False
+
+    def load_platform_calibration(self, path: Path) -> bool:
+        try:
+            root = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            metadata = self.yaml_map(root.get("metadata", {}))
+            if normalize_calibration_type(metadata.get("calibration_type", "")) != "platform_reference":
+                raise ValueError("expected metadata.calibration_type=platform_reference")
+            transform = self.yaml_map(root.get("transform", {}))
+            if not transform:
+                raise ValueError("missing transform")
+            translation, rotation = self.parse_transform_values(transform)
+            parent = str(metadata.get("transform_parent_frame") or self.platform_parent_frame).strip().strip("/")
+            child = str(metadata.get("transform_child_frame") or self.platform_frame).strip().strip("/")
+            if not parent or not child:
+                raise ValueError("missing transform parent/child frame")
+            self.platform_parent_frame = parent
+            self.platform_frame = child
+            self.platform_translation = translation
+            self.platform_rotation = rotation
+            self.platform_calibration_file = str(path)
+            return True
+        except Exception as exc:
+            self.get_logger().warn(f"Failed to load platform calibration {path}: {exc}")
+            return False
+
+    def publish_static_transform(
+        self,
+        parent_frame: str,
+        child_frame: str,
+        translation: Tuple[float, float, float],
+        rotation: Tuple[float, float, float, float],
+    ) -> None:
+        msg = TransformStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = parent_frame
+        msg.child_frame_id = child_frame
+        msg.transform.translation.x = float(translation[0])
+        msg.transform.translation.y = float(translation[1])
+        msg.transform.translation.z = float(translation[2])
+        msg.transform.rotation.x = float(rotation[0])
+        msg.transform.rotation.y = float(rotation[1])
+        msg.transform.rotation.z = float(rotation[2])
+        msg.transform.rotation.w = float(rotation[3])
+        self.static_tf_broadcaster.sendTransform(msg)
+
+    def load_and_publish_station_calibration_tfs(self) -> None:
+        if not self.publish_static_calibration_tfs:
+            return
+        eye_path = self.resolve_calibration_file(
+            self.eye_to_hand_calibration_file,
+            "axab_calibration_eyetohand_",
+            "eye-to-hand",
+        )
+        platform_path = self.resolve_calibration_file(
+            self.platform_calibration_file,
+            "platform_calibration_",
+            "platform",
+        )
+        if eye_path is not None and self.load_eye_to_hand_calibration(eye_path):
+            self.publish_static_transform(
+                self.calibration_parent_frame,
+                self.calibration_child_frame,
+                self.calibration_translation,
+                self.calibration_rotation,
+            )
+            self.get_logger().info(
+                f"YOLO teach loaded eye-to-hand TF {self.calibration_parent_frame}->{self.calibration_child_frame} "
+                f"from {eye_path}")
+        if platform_path is not None and self.load_platform_calibration(platform_path):
+            self.publish_static_transform(
+                self.platform_parent_frame,
+                self.platform_frame,
+                self.platform_translation,
+                self.platform_rotation,
+            )
+            self.get_logger().info(
+                f"YOLO teach loaded platform TF {self.platform_parent_frame}->{self.platform_frame} "
+                f"from {platform_path}")
+
+    def project_platform_roi_points(
+        self,
+        platform_frame: str,
+        platform_points: List[Tuple[float, float, float]],
+    ) -> Optional[List[Tuple[float, float]]]:
+        info = self.latest_camera_info
+        if info is None or not platform_frame or len(platform_points) != 4:
+            return None
+        camera_frame = (
+            self.projection_camera_frame or
+            str(getattr(info.header, "frame_id", "") or "")
+        ).strip().strip("/")
+        if not camera_frame:
+            return None
+        if info.k[0] <= 1e-6 or info.k[4] <= 1e-6:
+            return None
+
+        if camera_frame == platform_frame:
+            translation = np.zeros(3, dtype=np.float64)
+            quaternion = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+        else:
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    camera_frame,
+                    platform_frame,
+                    rclpy.time.Time(),
+                    timeout=Duration(seconds=0.05),
+                )
+            except Exception:
+                return None
+            translation = np.array([
+                float(transform.transform.translation.x),
+                float(transform.transform.translation.y),
+                float(transform.transform.translation.z),
+            ], dtype=np.float64)
+            quaternion = np.array([
+                float(transform.transform.rotation.x),
+                float(transform.transform.rotation.y),
+                float(transform.transform.rotation.z),
+                float(transform.transform.rotation.w),
+            ], dtype=np.float64)
+
+        projected: List[Tuple[float, float]] = []
+        for point in platform_points:
+            source_point = np.array(point, dtype=np.float64)
+            camera_point = translation + self.rotate_vector_by_quaternion(source_point, quaternion)
+            if not np.isfinite(camera_point).all() or camera_point[2] <= 1e-6:
+                return None
+            u = (camera_point[0] * float(info.k[0]) / camera_point[2]) + float(info.k[2])
+            v = (camera_point[1] * float(info.k[4]) / camera_point[2]) + float(info.k[5])
+            if not np.isfinite([u, v]).all():
+                return None
+            projected.append((float(u), float(v)))
+        return projected
+
+    @staticmethod
+    def roi_points_close(
+        lhs: List[Tuple[float, float]],
+        rhs: List[Tuple[float, float]],
+        tolerance_px: float = 0.5,
+    ) -> bool:
+        if len(lhs) != len(rhs):
+            return False
+        for left, right in zip(lhs, rhs):
+            if abs(float(left[0]) - float(right[0])) > tolerance_px:
+                return False
+            if abs(float(left[1]) - float(right[1])) > tolerance_px:
+                return False
+        return True
+
+    def update_active_bin_platform_projection(self) -> None:
+        active_bin = self.active_bin
+        if active_bin is None:
+            return
+        projected_roi = self.project_platform_roi_points(
+            active_bin.platform_roi_frame,
+            active_bin.platform_roi_corners,
+        )
+        if projected_roi is None:
+            active_bin.roi_points = []
+            self.status = f"Waiting for platform ROI projection: {active_bin.bin_name}"
+            return
+        if self.roi_points_close(projected_roi, active_bin.roi_points):
+            active_bin.roi_points_source = "platform_roi_corners"
+            self.save_session()
+            return
+        active_bin.roi_points = projected_roi
+        active_bin.roi_points_source = "platform_roi_corners"
+        self.clear_prompts(save=False)
+        self.status = f"Regenerated bin ROI from platform corners: {active_bin.bin_name}"
+        self.save_session()
 
     def color_callback(self, msg: Image) -> None:
         try:
@@ -2884,6 +3572,10 @@ class ItemTeachYoloNode(Node):
             self.latest_bgr = bgr.copy()
             self.latest_header_stamp = f"{msg.header.stamp.sec}.{msg.header.stamp.nanosec:09d}"
 
+    def camera_info_callback(self, msg: CameraInfo) -> None:
+        self.latest_camera_info = msg
+        self.update_active_bin_platform_projection()
+
     def select_bin(self, index: int) -> None:
         if self.recording_active:
             self.status = "Stop ROI recording before changing bin"
@@ -2894,8 +3586,13 @@ class ItemTeachYoloNode(Node):
         self.active_bin = self.bin_entries[index]
         self.bin_dropdown_open = False
         self.clear_prompts(save=False)
-        self.status = f"Loaded bin ROI: {self.active_bin.bin_name}"
+        self.update_active_bin_platform_projection()
+        if self.active_bin.roi_points:
+            self.status = f"Loaded bin ROI from platform corners: {self.active_bin.bin_name}"
+        else:
+            self.status = f"Waiting for platform ROI projection: {self.active_bin.bin_name}"
         self.save_session()
+        self.request_teach_joint_snapshot_for_item_setup()
 
     def latest_frame_copy(self) -> Optional[np.ndarray]:
         with self.lock:
@@ -2907,6 +3604,9 @@ class ItemTeachYoloNode(Node):
         frame: np.ndarray,
     ) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int], np.ndarray, np.ndarray, np.ndarray]]:
         if frame is None or self.active_bin is None:
+            return None
+        if len(self.active_bin.roi_points) < 3:
+            self.status = f"Waiting for platform ROI projection: {self.active_bin.bin_name}"
             return None
         h, w = frame.shape[:2]
         points = np.asarray(self.active_bin.roi_points, dtype=np.float32)
@@ -3278,6 +3978,294 @@ class ItemTeachYoloNode(Node):
             self.training_epoch_current = 0
             self.training_progress = 0.0
 
+    def package_yolo_version_number(self) -> str:
+        return self.package_yolo_version.replace("yolo", "")
+
+    def package_detection_backend(self) -> str:
+        return f"{self.package_yolo_version}_seg_pt"
+
+    def package_model_label(self) -> str:
+        if self.package_model_path is None:
+            return "Open .pt"
+        return f"Model: {self.package_model_path.name}"
+
+    def can_save_existing_model_teach(self) -> bool:
+        training_active = self.training_thread is not None and self.training_thread.is_alive()
+        return (
+            not training_active and
+            not self.recording_active and
+            self.has_item_name() and
+            self.active_bin is not None and
+            self.package_model_path is not None and
+            self.package_model_path.exists() and
+            self.package_model_path.suffix.lower() == ".pt"
+        )
+
+    def open_package_model_dialog(self) -> Optional[Path]:
+        start_dir = self.model_root if self.model_root.exists() else workspace_root()
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                root.attributes("-topmost", True)
+            except tk.TclError:
+                pass
+            selected = filedialog.askopenfilename(
+                title="Select YOLO .pt model",
+                initialdir=str(start_dir),
+                filetypes=[
+                    ("YOLO PT models", "*.pt"),
+                    ("All files", "*.*"),
+                ],
+            )
+            root.destroy()
+            return Path(selected).expanduser().resolve() if selected else None
+        except Exception as exc:
+            self.get_logger().warn(f"Tk YOLO model picker unavailable: {exc}")
+
+        for command in ("zenity", "kdialog"):
+            if shutil.which(command) is None:
+                continue
+            try:
+                if command == "zenity":
+                    result = subprocess.run(
+                        [
+                            "zenity",
+                            "--file-selection",
+                            "--title=Select YOLO .pt model",
+                            f"--filename={str(start_dir)}/",
+                            "--file-filter=YOLO PT models | *.pt",
+                            "--file-filter=All files | *",
+                        ],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=300,
+                    )
+                else:
+                    result = subprocess.run(
+                        [
+                            "kdialog",
+                            "--title",
+                            "Select YOLO .pt model",
+                            "--getopenfilename",
+                            str(start_dir),
+                            "YOLO PT models (*.pt)",
+                        ],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=300,
+                    )
+                selected = result.stdout.strip()
+                if result.returncode == 0 and selected:
+                    return Path(selected).expanduser().resolve()
+                return None
+            except Exception as exc:
+                self.get_logger().warn(f"{command} YOLO model picker failed: {exc}")
+        self.status = "Could not open YOLO model file picker"
+        return None
+
+    def select_package_model(self) -> None:
+        if self.training_thread is not None and self.training_thread.is_alive():
+            self.status = "Cannot select .pt while training"
+            return
+        if self.recording_active:
+            self.status = "Stop ROI recording before selecting .pt"
+            return
+        selected = self.open_package_model_dialog()
+        if selected is None:
+            self.status = "YOLO model selection cancelled"
+            return
+        if selected.suffix.lower() != ".pt":
+            self.status = "Select a YOLO .pt file"
+            return
+        if not selected.exists() or not selected.is_file() or selected.stat().st_size <= 0:
+            self.status = f"Selected model is missing or empty: {selected}"
+            return
+        self.package_model_path = selected
+        detected_version = detect_yolo_version_in_text(selected.name)
+        if detected_version is not None:
+            self.package_yolo_version = detected_version
+        self.status = (
+            f"Selected {self.package_yolo_version.upper()} model: {selected.name}"
+        )
+        self.save_session()
+
+    def toggle_package_yolo_version(self) -> None:
+        if self.training_thread is not None and self.training_thread.is_alive():
+            self.status = "Cannot change YOLO version while training"
+            return
+        current_index = SUPPORTED_PACKAGE_YOLO_VERSIONS.index(
+            normalize_package_yolo_version(self.package_yolo_version)
+        )
+        self.package_yolo_version = SUPPORTED_PACKAGE_YOLO_VERSIONS[
+            (current_index + 1) % len(SUPPORTED_PACKAGE_YOLO_VERSIONS)
+        ]
+        self.status = f"Package version set to {self.package_yolo_version.upper()}"
+        self.save_session()
+
+    def unique_packaged_model_dir(self, item_token: str) -> Path:
+        self.profile_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"{item_token}_{iso_date_for_path()}"
+        path = self.profile_dir / stem
+        suffix = 1
+        while path.exists():
+            path = self.profile_dir / f"{stem}_{suffix}"
+            suffix += 1
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def write_existing_model_profile(self, model_dir: Path, model_path: Path) -> Path:
+        active_bin = self.active_bin
+        if active_bin is None:
+            raise RuntimeError("Load a Bin Teach file before saving YOLO teach.")
+        item_token = safe_name(self.item_name)
+        if not item_token:
+            raise RuntimeError("Enter item name before saving YOLO teach.")
+        created_at = _dt.datetime.now().isoformat(timespec="seconds")
+        params = {
+            "detection_backend": self.package_detection_backend(),
+            "yolo_version": self.package_yolo_version,
+            "model_family": self.package_yolo_version.upper(),
+            "item_name": self.item_name,
+            "teach_date": iso_date_for_path(),
+            "teach_date_compact": compact_date_for_path(),
+            "created_at": created_at,
+            "class_id": 0,
+            "class_name": self.item_name,
+            "color_topic": self.color_topic,
+            "depth_topic": self.depth_topic,
+            "camera_info_topic": self.camera_info_topic,
+            "projection_camera_frame": self.projection_camera_frame,
+            "overlay_topic": self.overlay_topic,
+            "robot_ip_address": self.robot_ip_address,
+            "calibration_dir": str(self.calibration_dir),
+            "calibration_file": self.eye_to_hand_calibration_file,
+            "platform_calibration_file": self.platform_calibration_file,
+            "camera_control_service_root": self.camera_control_service_root,
+            "color_exposure_us": self.color_exposure_us,
+            "depth_exposure_us": 0,
+            "color_exposure_percent": exposure_usec_to_percent(
+                self.color_exposure_us,
+                self.color_exposure_min_us,
+                self.color_exposure_max_us),
+            "depth_exposure_percent": 0,
+            "color_exposure_min_us": self.color_exposure_min_us,
+            "color_exposure_max_us": self.color_exposure_max_us,
+            "depth_exposure_min_us": self.depth_exposure_min_us,
+            "depth_exposure_max_us": self.depth_exposure_max_us,
+            "session_dir": str(self.session_dir),
+            "model_dir": str(model_dir),
+            "model_path": str(model_path),
+            "model_pt_path": str(model_path),
+            "model_pt_filename": model_path.name,
+            "trained_model_path": str(model_path),
+            "packaged_from_model_path": str(self.package_model_path) if self.package_model_path else "",
+            "sample_count": self.sample_count,
+            "background_sample_count": self.background_sample_count,
+            "total_training_image_count": self.total_training_image_count(),
+            "background_ratio_percent": self.background_ratio_percent(),
+            "train_epochs": 0,
+            "train_imgsz": self.train_imgsz,
+            "train_device": "",
+            "train_use_gpu_if_available": self.train_use_gpu_if_available,
+            "train_device_used": "external_pt",
+            "associated_bin_name": active_bin.bin_name,
+            "bin_teach_file": str(active_bin.path),
+            "detection_mode": "yolo_depth",
+            "motion_service_root": self.motion_service_root,
+            "get_angle_service": self.get_angle_service_name,
+            "teach_joints_deg": self.latest_joint_positions_deg if self.has_joint_positions else [],
+            "has_teach_joints": self.has_joint_positions,
+            "teach_joints_source": self.teach_joints_source,
+            "roi_points": [
+                int(round(value))
+                for point in active_bin.roi_points
+                for value in point
+            ],
+            "roi_points_source": active_bin.roi_points_source,
+            "roi_crop_rect": list(self.roi_crop_rect) if self.roi_crop_rect else [],
+        }
+        if active_bin.platform_roi_frame and active_bin.platform_roi_corners:
+            params["platform_roi_corners"] = {
+                "coordinate_frame": active_bin.platform_roi_frame,
+                "units": "m",
+                "points": [
+                    {
+                        "role": role,
+                        "position": {
+                            "x": float(point[0]),
+                            "y": float(point[1]),
+                            "z": float(point[2]),
+                        },
+                    }
+                    for role, point in zip(
+                        ("upper_left", "upper_right", "lower_right", "lower_left"),
+                        active_bin.platform_roi_corners,
+                    )
+                ],
+            }
+        profile = {
+            "schema_version": 1,
+            "item": {
+                "id": item_token,
+                "display_name": self.item_name,
+            },
+            "teach": {"ros__parameters": copy.deepcopy(params)},
+            "item_detect": {"ros__parameters": copy.deepcopy(params)},
+            "item_yolo": {"ros__parameters": copy.deepcopy(params)},
+        }
+        profile_path = model_dir / f"{item_token}.yaml"
+        profile_path.write_text(yaml.safe_dump(profile, sort_keys=False), encoding="utf-8")
+        return profile_path
+
+    def save_existing_model_teach(self) -> None:
+        if self.training_thread is not None and self.training_thread.is_alive():
+            self.status = "Cannot save existing model while training"
+            return
+        if self.recording_active:
+            self.status = "Stop ROI recording before saving YOLO teach"
+            return
+        if not self.has_item_name():
+            self.status = self.item_name_error()
+            return
+        if self.active_bin is None:
+            self.status = "Load a Bin Teach file before saving YOLO teach"
+            return
+        if self.package_model_path is None:
+            self.status = "Open a YOLO .pt model before saving teach"
+            return
+        source_model = self.package_model_path
+        if not source_model.exists() or source_model.suffix.lower() != ".pt":
+            self.status = f"Selected .pt model missing: {source_model}"
+            return
+
+        item_token = safe_name(self.item_name)
+        model_dir = self.unique_packaged_model_dir(item_token)
+        final_pt = model_dir / f"{item_token}_{self.package_yolo_version}.pt"
+        try:
+            if source_model.resolve() != final_pt.resolve():
+                shutil.copy2(source_model, final_pt)
+            profile_path = self.write_existing_model_profile(model_dir, final_pt)
+        except Exception as exc:
+            shutil.rmtree(model_dir, ignore_errors=True)
+            self.status = f"Save YOLO teach failed: {exc}"
+            self.get_logger().warn(self.status)
+            return
+
+        self.final_model_dir = str(model_dir)
+        self.trained_model_path = str(final_pt)
+        self.latest_profile_path = str(profile_path)
+        self.training_status = "packaged"
+        self.training_epoch_current = 0
+        self.training_progress = 1.0
+        self.status = f"Saved YOLO teach: {model_dir.name}"
+        self.save_session()
+
     def start_training(self) -> None:
         if self.training_thread is not None and self.training_thread.is_alive():
             self.status = "Training already running"
@@ -3377,7 +4365,7 @@ class ItemTeachYoloNode(Node):
             self.promote_trained_model(best_path)
             self.update_training_progress(self.training_epoch_total, self.training_epoch_total, "done")
             self.training_status = "done"
-            self.status = f"Training done: {self.trained_onnx_path or self.trained_model_path}"
+            self.status = f"Training done: {self.trained_model_path}"
             self.write_profile()
         except Exception as exc:
             self.training_status = f"failed: {exc}"
@@ -3409,33 +4397,12 @@ class ItemTeachYoloNode(Node):
         if not best_path.exists():
             raise FileNotFoundError(f"YOLO best.pt missing: {best_path}")
 
-        from ultralytics import YOLO
-
         model_dir = self.unique_model_dir()
-        final_onnx = model_dir / "best.onnx"
-
-        try:
-            trained_model = YOLO(str(best_path))
-            export_device = self.train_device_used or self.effective_train_device()
-            exported = trained_model.export(
-                format="onnx",
-                imgsz=self.train_imgsz,
-                device=export_device,
-                dynamic=False,
-                simplify=False,
-            )
-            exported_file = Path(str(exported))
-            if exported_file.exists():
-                shutil.copy2(exported_file, final_onnx)
-            if not final_onnx.exists():
-                raise FileNotFoundError(f"YOLO ONNX export did not create {final_onnx}")
-        except Exception as exc:
-            shutil.rmtree(model_dir, ignore_errors=True)
-            raise RuntimeError(f"YOLO ONNX export failed; detect requires ONNX: {exc}") from exc
+        final_pt = model_dir / "best.pt"
+        shutil.copy2(best_path, final_pt)
 
         self.final_model_dir = str(model_dir)
-        self.trained_model_path = ""
-        self.trained_onnx_path = str(final_onnx)
+        self.trained_model_path = str(final_pt)
 
     def write_profile(self) -> None:
         if not self.final_model_dir:
@@ -3446,7 +4413,7 @@ class ItemTeachYoloNode(Node):
         date_match = re.search(r"_(\d{8})(?:_\d+)?$", model_dir.name)
         date_stamp = date_match.group(1) if date_match else compact_date_for_path()
         params = {
-            "detection_backend": "yolo11_seg_onnx",
+            "detection_backend": "yolo11_seg_pt",
             "item_name": self.item_name,
             "teach_date": date_stamp,
             "class_id": 0,
@@ -3454,7 +4421,12 @@ class ItemTeachYoloNode(Node):
             "color_topic": self.color_topic,
             "depth_topic": self.depth_topic,
             "camera_info_topic": self.camera_info_topic,
+            "projection_camera_frame": self.projection_camera_frame,
             "overlay_topic": self.overlay_topic,
+            "robot_ip_address": self.robot_ip_address,
+            "calibration_dir": str(self.calibration_dir),
+            "calibration_file": self.eye_to_hand_calibration_file,
+            "platform_calibration_file": self.platform_calibration_file,
             "camera_control_service_root": self.camera_control_service_root,
             "color_exposure_us": self.color_exposure_us,
             "depth_exposure_us": 0,
@@ -3469,8 +4441,7 @@ class ItemTeachYoloNode(Node):
             "depth_exposure_max_us": self.depth_exposure_max_us,
             "session_dir": str(self.session_dir),
             "model_dir": self.final_model_dir,
-            "model_path": self.trained_onnx_path,
-            "model_onnx_path": self.trained_onnx_path,
+            "model_path": self.trained_model_path,
             "model_pt_path": self.trained_model_path,
             "sample_count": self.sample_count,
             "background_sample_count": self.background_sample_count,
@@ -3482,12 +4453,9 @@ class ItemTeachYoloNode(Node):
             "train_use_gpu_if_available": self.train_use_gpu_if_available,
             "train_device_used": self.train_device_used,
             "trained_model_path": self.trained_model_path,
-            "trained_onnx_path": self.trained_onnx_path,
             "associated_bin_name": active_bin.bin_name if active_bin else "",
             "bin_teach_file": str(active_bin.path) if active_bin else "",
             "detection_mode": "yolo_depth",
-            "depth_window_mm": 50,
-            "align_item_z_axis_to_depth_plane": True,
             "motion_service_root": self.motion_service_root,
             "get_angle_service": self.get_angle_service_name,
             "teach_joints_deg": self.latest_joint_positions_deg if self.has_joint_positions else [],
@@ -3498,18 +4466,29 @@ class ItemTeachYoloNode(Node):
                 for point in (active_bin.roi_points if active_bin else [])
                 for value in point
             ],
+            "roi_points_source": active_bin.roi_points_source if active_bin else "",
             "roi_crop_rect": list(self.roi_crop_rect) if self.roi_crop_rect else [],
-            "depth_plane": active_bin.depth_plane if active_bin else {},
         }
         if active_bin:
-            depth_plane = active_bin.depth_plane
-            params["depth_plane_source"] = "bin_teach"
-            params["depth_plane_enabled"] = bool(depth_plane.get("depth_plane_enabled", False))
-            params["depth_plane_a"] = float(depth_plane.get("depth_plane_a", 0.0))
-            params["depth_plane_b"] = float(depth_plane.get("depth_plane_b", 0.0))
-            params["depth_plane_c"] = float(depth_plane.get("depth_plane_c", 0.0))
-            params["depth_plane_reference_depth_m"] = float(
-                depth_plane.get("depth_plane_reference_depth_m", 0.0))
+            if active_bin.platform_roi_frame and active_bin.platform_roi_corners:
+                params["platform_roi_corners"] = {
+                    "coordinate_frame": active_bin.platform_roi_frame,
+                    "units": "m",
+                    "points": [
+                        {
+                            "role": role,
+                            "position": {
+                                "x": float(point[0]),
+                                "y": float(point[1]),
+                                "z": float(point[2]),
+                            },
+                        }
+                        for role, point in zip(
+                            ("upper_left", "upper_right", "lower_right", "lower_left"),
+                            active_bin.platform_roi_corners,
+                        )
+                    ],
+                }
         profile = {
             "item_detect": {"ros__parameters": params},
             "item_yolo": {"ros__parameters": params},
@@ -3557,8 +4536,8 @@ class ItemTeachYoloNode(Node):
     def draw_review_frame_sample_overlay(self, image: np.ndarray) -> None:
         if image.size == 0 or not self.review_mode:
             return
-        count = self.review_frame_sample_count()
-        label = f"Samples here: {count}"
+        item_count, background_count, total_count = self.review_frame_sample_breakdown()
+        label = f"Samples: {total_count} | Item {item_count} | BG {background_count}"
         font = cv2.FONT_HERSHEY_SIMPLEX
         scale = max(0.55, min(0.95, image.shape[1] / 1800.0))
         thickness = 2
@@ -4026,13 +5005,21 @@ class ItemTeachYoloNode(Node):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.50, (205, 218, 226), 1, cv2.LINE_AA)
         cv2.putText(panel, self.background_ratio_label(), (PANEL_PAD, y + 42),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.46, self.background_ratio_color(), 1, cv2.LINE_AA)
+        self.draw_button(
+            panel,
+            "delete_last_sample",
+            (PANEL_PAD, y + 52, LEFT_PANEL_WIDTH - 2 * PANEL_PAD, BUTTON_HEIGHT),
+            "Delete Last Sample",
+            self.can_delete_last_sample(),
+            role="danger",
+        )
         joint_status = "Teach Position: captured" if self.has_joint_positions else "Teach Position: waiting"
-        cv2.putText(panel, joint_status, (PANEL_PAD, y + 66),
+        cv2.putText(panel, joint_status, (PANEL_PAD, y + 106),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.46,
                     (184, 224, 194) if self.has_joint_positions else (205, 188, 170),
                     1,
                     cv2.LINE_AA)
-        y += 76
+        y += 116
 
         y = self.draw_section_header(panel, "Training", y + 8)
         self.draw_gpu_training_slider(
@@ -4185,6 +5172,16 @@ class ItemTeachYoloNode(Node):
         load_label = "Load Session" if self.saved_session_entries else "Load: none"
         self.draw_button(canvas, "load_session", (x, y, 170, BUTTON_HEIGHT),
                          load_label, load_enabled, self.load_session_dropdown_open)
+        x += 184
+        package_enabled = not training_active and not self.recording_active
+        self.draw_button(canvas, "open_package_model", (x, y, 132, BUTTON_HEIGHT),
+                         self.package_model_label(), package_enabled)
+        x += 144
+        self.draw_button(canvas, "toggle_package_yolo_version", (x, y, 104, BUTTON_HEIGHT),
+                         f"YOLO: {self.package_yolo_version_number()}", package_enabled)
+        x += 116
+        self.draw_button(canvas, "save_existing_model_teach", (x, y, 142, BUTTON_HEIGHT),
+                         "Save Teach", self.can_save_existing_model_teach(), role="save")
         status = "Full frame ROI view"
         if self.recording_active:
             status = f"Capturing ROI | {self.recording_frame_count} frames"
@@ -4391,6 +5388,12 @@ class ItemTeachYoloNode(Node):
                     self.toggle_gpu_training()
                 elif name == "train_yolo":
                     self.start_training()
+                elif name == "open_package_model":
+                    self.select_package_model()
+                elif name == "toggle_package_yolo_version":
+                    self.toggle_package_yolo_version()
+                elif name == "save_existing_model_teach":
+                    self.save_existing_model_teach()
                 elif name == "live_view":
                     self.load_session_dropdown_open = False
                     self.live_view_enabled = not self.live_view_enabled

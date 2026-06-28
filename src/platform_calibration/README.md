@@ -35,5 +35,8 @@ Default frame path:
 base_link -> bin_calibrated_camera_link -> aruco_marker_1..4
 ```
 
+Platform calibration requires all four marker IDs: `1`, `2`, `3`, and `4`.
+Duplicate or substitute IDs are not accepted.
+
 The saved YAML is a `base_link -> <platform_name>` transform. `bin_teach`
 can use that platform frame when teaching bin poses.

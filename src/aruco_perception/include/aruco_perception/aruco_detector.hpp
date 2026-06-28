@@ -54,6 +54,8 @@ private:
   void publishOverlay(const rclcpp::Time &stamp, const cv::Mat &color_bgr,
                       const cv::Mat &depth_image, const CameraInfoMsg &info,
                       const std::vector<MarkerPose> &markers);
+  void drawBinRoiDotsOverlay(cv::Mat &color_overlay, cv::Mat &depth_overlay,
+                             const std::vector<MarkerPose> &markers) const;
   void renderNoCameraTopicsOverlay();
   static void onMouseThunk(int event, int x, int y, int flags, void *userdata);
   void onMouse(int event, int x, int y, int flags);
@@ -120,10 +122,13 @@ private:
   bool publish_viz_{true};
   bool publish_overlay_{true};
   bool show_overlay_window_{true};
+  bool show_bin_roi_dots_overlay_{false};
   double depth_colormap_max_{1.5};
   std::string overlay_topic_;
   std::string detections_topic_;
   double overlay_rate_hz_{10.0};
+  std::vector<int64_t> bin_roi_allowed_marker_ids_{1, 2, 3, 4};
+  int bin_roi_required_marker_count_{4};
   rclcpp::Time last_overlay_stamp_{0, 0, RCL_ROS_TIME};
 
   // Tunable visualization parameters

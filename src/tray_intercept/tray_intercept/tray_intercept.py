@@ -14,7 +14,6 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time
 
-from dobot_msgs_v4.msg import TrayVector
 from dobot_msgs_v4.srv import (
     CP,
     DO,
@@ -26,7 +25,7 @@ from dobot_msgs_v4.srv import (
     Stop,
     TrayInterceptStart,
 )
-from geometry_msgs.msg import PolygonStamped, TransformStamped
+from geometry_msgs.msg import PolygonStamped, PoseStamped, TransformStamped
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
@@ -88,16 +87,15 @@ def workspace_path(*parts: str) -> Path:
 
 CALIBRATION_FILE_PATH = workspace_path('calibration', 'relmovl_speed_calibration.json')
 CALIBRATION_DIR_PATH = workspace_path('calibration')
-TRAY_VECTOR_TOPIC = 'tray_vector'
+TRAY_TARGET_POSE_TOPIC = 'tray_target_pose'
 TRAY_AXIS_OVERLAY_TOPIC = 'tray_axis_overlay'
 ROBOT_GOAL_FRAME_DEFAULT = 'base_link'
 POST_STOP_MOVL_GOAL_DEBUG_FRAME_DEFAULT = 'tray_movel_goal_tcp'
 FOLLOW_MOVL_GOAL_DEBUG_FRAME_DEFAULT = 'tray_follow_goal_tcp'
 POST_FOLLOW_ZUP_GOAL_DEBUG_FRAME_DEFAULT = 'tray_post_follow_zup_goal_tcp'
-TRAY_VECTOR_WATCH_TIMEOUT_SEC = 60.0
-TRAY_VECTOR_WATCH_TIMEOUT_MIN = 1.0
-TRAY_VECTOR_WATCH_TIMEOUT_MAX = 60.0
-TRAY_VECTOR_MOTION_NOISE_FLOOR_MM_S = 5.0
+TRAY_TARGET_POSE_WATCH_TIMEOUT_SEC = 60.0
+TRAY_TARGET_POSE_WATCH_TIMEOUT_MIN = 1.0
+TRAY_TARGET_POSE_WATCH_TIMEOUT_MAX = 60.0
 POST_STOP_MOVL_SPEED_MAX = 650.0
 FIXED_EE_INTERCEPT_SPEED_MM_S = 650.0
 EE_FINAL_POSE_ANGLE_MIN_DEG = -90.0
@@ -117,7 +115,6 @@ FOLLOW_DISTANCE_MAX = 400.0
 POST_FOLLOW_Z_UP_MIN = 0.0
 POST_FOLLOW_Z_UP_MAX = 300.0
 GOAL_TF_LOOKUP_TIMEOUT_SEC_DEFAULT = 0.2
-TRAY_PREDICTION_MAX_LEAD_SEC_DEFAULT = 3.0
 START_SEQUENCE_SERVICE_DEFAULT = 'tray_intercept/start_sequence'
 TRACK_SERVICE_DEFAULT = 'tray_intercept/track'
 TRACK_STATUS_SERVICE_DEFAULT = 'tray_intercept/track_status'
@@ -185,18 +182,15 @@ class MiniSnapshot:
 
 
 @dataclass(frozen=True)
-class TrayVectorTarget:
+class TrayPoseTarget:
     position_mm: tuple[float, float, float]
     rpy_deg: tuple[float, float, float]
     frame_id: str
     stamp_sec: float
-    decay_sec: float
-    speed_mmps: float
-    direction_unit: tuple[float, float, float]
 
 
 @dataclass(frozen=True)
-class PredictedGoal:
+class StationaryGoal:
     x_mm: float
     y_mm: float
     z_mm: float
@@ -204,10 +198,7 @@ class PredictedGoal:
     ry_deg: float
     rz_deg: float
     source_frame_id: str
-    lead_time_sec: float
     tray_age_sec: float
-    tray_speed_base_mmps: float
-    follow_direction_base_unit: tuple[float, float, float]
     ee_angle_signed_deg: float = 0.0
     ee_angle_direction_label: str = 'none'
 
@@ -231,15 +222,21 @@ class RelMovLMiniNode(Node):
         self._tcp_pose_tool = int(float(self.declare_parameter('tcp_pose_tool', 0).value))
         self._tcp_pose_request_in_flight = False
         self._tcp_pose_warning_logged = False
-        self._tray_vector_topic = str(
-            self.declare_parameter('tray_vector_topic', TRAY_VECTOR_TOPIC).value
-        ).strip() or TRAY_VECTOR_TOPIC
+        legacy_tray_vector_topic = str(
+            self.declare_parameter('tray_vector_topic', '').value
+        ).strip()
+        self._tray_target_pose_topic = str(
+            self.declare_parameter(
+                'tray_target_pose_topic',
+                legacy_tray_vector_topic or TRAY_TARGET_POSE_TOPIC,
+            ).value
+        ).strip() or TRAY_TARGET_POSE_TOPIC
         self._speed_calibration_path: Path | None = None
         self._calibration_startup_cp: int | None = None
         self._calibration_startup_speed_factor: int | None = None
         self._startup_motion_profile_applied = False
         self._axis_speed_lookup = self._load_speed_calibration()
-        self._tray_vector_seq = 0
+        self._tray_target_pose_seq = 0
         self._tray_watch_armed = False
         self._tray_watch_seq_floor = 0
         self._tray_watch_deadline_monotonic = 0.0
@@ -248,14 +245,14 @@ class RelMovLMiniNode(Node):
         self._tray_watch_tf_only_mode = bool(
             self.declare_parameter('tf_only_mode', True).value
         )
-        self._tray_vector_watch_timeout_sec = max(
-            TRAY_VECTOR_WATCH_TIMEOUT_MIN,
+        self._tray_target_pose_watch_timeout_sec = max(
+            TRAY_TARGET_POSE_WATCH_TIMEOUT_MIN,
             min(
-                TRAY_VECTOR_WATCH_TIMEOUT_MAX,
+                TRAY_TARGET_POSE_WATCH_TIMEOUT_MAX,
                 float(
                     self.declare_parameter(
                         'tray_vector_wait_timeout_sec',
-                        TRAY_VECTOR_WATCH_TIMEOUT_SEC,
+                        TRAY_TARGET_POSE_WATCH_TIMEOUT_SEC,
                     ).value
                 ),
             ),
@@ -357,13 +354,6 @@ class RelMovLMiniNode(Node):
                 GOAL_TF_LOOKUP_TIMEOUT_SEC_DEFAULT,
             ).value),
         )
-        self._tray_prediction_max_lead_sec = max(
-            0.0,
-            float(self.declare_parameter(
-                'tray_prediction_max_lead_sec',
-                TRAY_PREDICTION_MAX_LEAD_SEC_DEFAULT,
-            ).value),
-        )
         self._start_sequence_service_name = str(
             self.declare_parameter(
                 'start_sequence_service',
@@ -421,12 +411,12 @@ class RelMovLMiniNode(Node):
         self._goal_tf_static_broadcaster = StaticTransformBroadcaster(self)
         self._goal_static_tf_by_child: dict[str, TransformStamped] = {}
         self._track_trigger_handler = None
-        self._last_tray_target: TrayVectorTarget | None = None
+        self._last_tray_target: TrayPoseTarget | None = None
         self._last_tray_preview_axes_valid = False
         self._last_tray_preview_x_axis = (1.0, 0.0)
         self._last_tray_preview_y_axis = (0.0, 1.0)
         self._tcp_pose_timer = self.create_timer(TCP_POSE_POLL_PERIOD_SEC, self._poll_tcp_pose)
-        self.create_subscription(TrayVector, self._tray_vector_topic, self._tray_vector_callback, 10)
+        self.create_subscription(PoseStamped, self._tray_target_pose_topic, self._tray_pose_callback, 10)
         self.create_subscription(PolygonStamped, self._tray_axis_overlay_topic, self._tray_axis_overlay_callback, 10)
         self._start_sequence_service = self.create_service(
             TrayInterceptStart,
@@ -455,7 +445,7 @@ class RelMovLMiniNode(Node):
         self.get_logger().info(f'Start tray sequence service: {self._start_sequence_service_name}')
         self.get_logger().info(f'Track virtual-click service: {self._track_service_name}')
         self.get_logger().info(f'Track armed status service: {self._track_status_service_name}')
-        self.get_logger().info(f'Tray vector topic: {self._tray_vector_topic}')
+        self.get_logger().info(f'Tray target pose topic: {self._tray_target_pose_topic}')
         self.get_logger().info(f'Motion service root: {self._motion_service_root}')
         self.get_logger().info(
             f'TCP pose service: {self._motion_service_root}/GetPose '
@@ -463,7 +453,7 @@ class RelMovLMiniNode(Node):
         )
         self.get_logger().info(
             'Startup settings: '
-            f'wait={self._tray_vector_watch_timeout_sec:.0f}s, '
+            f'wait={self._tray_target_pose_watch_timeout_sec:.0f}s, '
             f'fixed_speed={self._post_stop_movel_speed_mm_s:.0f} mm/s, '
             f'ee_angle={self._ee_final_pose_angle_deg:.0f} deg, '
             'align_ee_to_tray_y=always, '
@@ -493,7 +483,7 @@ class RelMovLMiniNode(Node):
         self._tray_watch_generation += 1
         self._tray_watch_armed = False
         self._tray_watch_stop_dispatched = False
-        self._tray_watch_seq_floor = self._tray_vector_seq
+        self._tray_watch_seq_floor = self._tray_target_pose_seq
         self._tray_watch_deadline_monotonic = 0.0
         self._cancel_requested = False
         self._snapshot.busy = False
@@ -511,7 +501,7 @@ class RelMovLMiniNode(Node):
                 busy=self._snapshot.busy,
                 armed=self._tray_watch_armed,
                 action_text=self._snapshot.action_text,
-                tray_seq=self._tray_vector_seq,
+                tray_seq=self._tray_target_pose_seq,
                 has_last_tray=self._last_tray_target is not None,
                 tray_preview_axes_valid=self._last_tray_preview_axes_valid,
                 tray_preview_x_axis=self._last_tray_preview_x_axis,
@@ -713,10 +703,6 @@ class RelMovLMiniNode(Node):
         return math.sqrt((vector_xyz[0] * vector_xyz[0]) + (vector_xyz[1] * vector_xyz[1]) + (vector_xyz[2] * vector_xyz[2]))
 
     @staticmethod
-    def _vector_dot3(left_xyz: tuple[float, float, float], right_xyz: tuple[float, float, float]) -> float:
-        return (left_xyz[0] * right_xyz[0]) + (left_xyz[1] * right_xyz[1]) + (left_xyz[2] * right_xyz[2])
-
-    @staticmethod
     def _normalize_vector3(vector_xyz: tuple[float, float, float]) -> tuple[float, float, float]:
         norm = RelMovLMiniNode._vector_norm3(vector_xyz)
         if norm <= 1e-12:
@@ -740,50 +726,6 @@ class RelMovLMiniNode(Node):
         if norm <= 1e-9:
             return None
         return (x / norm, y / norm)
-
-    @staticmethod
-    def _solve_intercept_time_sec(
-        relative_position_mm: tuple[float, float, float],
-        target_velocity_mmps: tuple[float, float, float],
-        interceptor_speed_mmps: float,
-    ) -> float | None:
-        s = max(1e-6, float(interceptor_speed_mmps))
-        r = (
-            float(relative_position_mm[0]),
-            float(relative_position_mm[1]),
-            float(relative_position_mm[2]),
-        )
-        v = (
-            float(target_velocity_mmps[0]),
-            float(target_velocity_mmps[1]),
-            float(target_velocity_mmps[2]),
-        )
-
-        c = RelMovLMiniNode._vector_dot3(r, r)
-        if c <= 1e-9:
-            return 0.0
-
-        a = RelMovLMiniNode._vector_dot3(v, v) - (s * s)
-        b = 2.0 * RelMovLMiniNode._vector_dot3(r, v)
-        eps = 1e-9
-
-        if abs(a) <= eps:
-            if abs(b) <= eps:
-                return None
-            t_linear = -c / b
-            return t_linear if t_linear >= 0.0 else None
-
-        disc = (b * b) - (4.0 * a * c)
-        if disc < 0.0:
-            return None
-
-        sqrt_disc = math.sqrt(max(0.0, disc))
-        t1 = (-b - sqrt_disc) / (2.0 * a)
-        t2 = (-b + sqrt_disc) / (2.0 * a)
-        candidates = [t for t in (t1, t2) if t >= 0.0]
-        if not candidates:
-            return None
-        return min(candidates)
 
     def _tray_pose_camera_to_base(
         self,
@@ -893,42 +835,28 @@ class RelMovLMiniNode(Node):
         self._goal_static_tf_by_child[child] = tf_msg
         self._goal_tf_static_broadcaster.sendTransform(list(self._goal_static_tf_by_child.values()))
 
-    def _tray_vector_callback(self, msg: TrayVector) -> None:
+    def _tray_pose_callback(self, msg: PoseStamped) -> None:
         header_stamp_sec = self._builtin_time_to_sec(msg.header.stamp)
-        last_stamp_sec = self._builtin_time_to_sec(msg.last_stamp)
-        tray_stamp_sec = last_stamp_sec if last_stamp_sec > 1e-9 else header_stamp_sec
-        raw_speed_mmps = max(0.0, float(msg.speed_mmps))
-        if raw_speed_mmps < TRAY_VECTOR_MOTION_NOISE_FLOOR_MM_S:
-            filtered_speed_mmps = 0.0
-            filtered_direction_unit = (0.0, 0.0, 0.0)
-        else:
-            filtered_speed_mmps = raw_speed_mmps
-            filtered_direction_unit = (
-                float(msg.direction_unit.x),
-                float(msg.direction_unit.y),
-                float(msg.direction_unit.z),
-            )
-        tray_target = TrayVectorTarget(
+        q = (
+            float(msg.pose.orientation.x),
+            float(msg.pose.orientation.y),
+            float(msg.pose.orientation.z),
+            float(msg.pose.orientation.w),
+        )
+        tray_target = TrayPoseTarget(
             position_mm=(
-                float(msg.position_mm.x),
-                float(msg.position_mm.y),
-                float(msg.position_mm.z),
+                float(msg.pose.position.x) * 1000.0,
+                float(msg.pose.position.y) * 1000.0,
+                float(msg.pose.position.z) * 1000.0,
             ),
-            rpy_deg=(
-                float(msg.rpy_deg.x),
-                float(msg.rpy_deg.y),
-                float(msg.rpy_deg.z),
-            ),
+            rpy_deg=self._quaternion_to_rpy_deg(self._quat_normalize(q)),
             frame_id=str(msg.header.frame_id),
-            stamp_sec=tray_stamp_sec,
-            decay_sec=max(0.0, float(getattr(msg, 'decay_sec', 0.0))),
-            speed_mmps=filtered_speed_mmps,
-            direction_unit=filtered_direction_unit,
+            stamp_sec=header_stamp_sec,
         )
 
         should_send_stop = False
         tf_only_mode = False
-        dispatch_target: TrayVectorTarget | None = None
+        dispatch_target: TrayPoseTarget | None = None
         x_offset_mm = 0.0
         y_offset_mm = 0.0
         z_offset_mm = 0.0
@@ -936,27 +864,27 @@ class RelMovLMiniNode(Node):
         post_follow_z_up_mm = 0.0
         ee_final_pose_angle_deg = EE_FINAL_POSE_ANGLE_DEFAULT_DEG
         release_grip_enabled = False
-        watch_timeout_sec = TRAY_VECTOR_WATCH_TIMEOUT_SEC
+        watch_timeout_sec = TRAY_TARGET_POSE_WATCH_TIMEOUT_SEC
         with self._lock:
-            self._tray_vector_seq += 1
+            self._tray_target_pose_seq += 1
             self._last_tray_target = tray_target
             if not self._tray_watch_armed:
                 return
-            if self._tray_vector_seq <= self._tray_watch_seq_floor:
+            if self._tray_target_pose_seq <= self._tray_watch_seq_floor:
                 return
             if self._tray_watch_stop_dispatched:
                 return
             if time.monotonic() > self._tray_watch_deadline_monotonic:
-                watch_timeout_sec = float(self._tray_vector_watch_timeout_sec)
+                watch_timeout_sec = float(self._tray_target_pose_watch_timeout_sec)
                 self._reset_runtime_state_locked(
-                    f'No tray vector within {watch_timeout_sec:.0f}s. Node reset.'
+                    f'No tray target pose within {watch_timeout_sec:.0f}s. Node reset.'
                 )
                 return
 
             self._tray_watch_armed = False
             self._tray_watch_stop_dispatched = True
             tf_only_mode = bool(self._tray_watch_tf_only_mode)
-            watch_timeout_sec = float(self._tray_vector_watch_timeout_sec)
+            watch_timeout_sec = float(self._tray_target_pose_watch_timeout_sec)
             should_send_stop = True
             dispatch_target = tray_target
             x_offset_mm = float(self._post_stop_x_offset_mm)
@@ -970,7 +898,7 @@ class RelMovLMiniNode(Node):
         if tf_only_mode:
             if should_send_stop and dispatch_target is not None:
                 self._set_action_text(
-                    'Tray vector update detected. Troubleshoot mode: goal TF preview only...'
+                    'Tray target pose detected. Troubleshoot mode: goal TF preview only...'
                 )
                 worker = threading.Thread(
                     target=self._preview_goal_only_request,
@@ -989,7 +917,7 @@ class RelMovLMiniNode(Node):
             return
 
         if should_send_stop and dispatch_target is not None:
-            self._set_action_text('Tray vector update detected. Sending Stop...')
+            self._set_action_text('Tray target pose detected. Sending Stop...')
             worker = threading.Thread(
                 target=self._send_stop_and_movel_request,
                 args=(
@@ -1008,14 +936,12 @@ class RelMovLMiniNode(Node):
 
     def _compute_base_goal_from_tray_target(
         self,
-        tray_target: TrayVectorTarget,
+        tray_target: TrayPoseTarget,
         x_offset_mm: float,
         y_offset_mm: float,
         z_offset_mm: float,
-        ee_speed_mmps: float,
         ee_final_pose_angle_deg: float = EE_FINAL_POSE_ANGLE_DEFAULT_DEG,
-        predict_target_motion: bool = True,
-    ) -> PredictedGoal | None:
+    ) -> StationaryGoal | None:
         target_x, target_y, target_z = tray_target.position_mm
         target_rx, target_ry, target_rz = tray_target.rpy_deg
         frame_id = tray_target.frame_id
@@ -1031,7 +957,7 @@ class RelMovLMiniNode(Node):
         if tray_base_pose is None:
             return None
 
-        tray_base_x, tray_base_y, tray_base_z, _, _, _, q_base_tray, q_base_camera = tray_base_pose
+        tray_base_x, tray_base_y, tray_base_z, _, _, _, q_base_tray, _ = tray_base_pose
         raw_tray_local_x_in_base = self._rotate_vector_by_quaternion((1.0, 0.0, 0.0), q_base_tray)
         raw_tray_local_y_in_base = self._rotate_vector_by_quaternion((0.0, 1.0, 0.0), q_base_tray)
         raw_tray_local_z_in_base = self._rotate_vector_by_quaternion((0.0, 0.0, 1.0), q_base_tray)
@@ -1045,41 +971,8 @@ class RelMovLMiniNode(Node):
                 'Detected tray Z points down; using base-XY tray axes and base-up standoff for robot safety.'
             )
 
-        speed_mmps = max(0.0, float(tray_target.speed_mmps))
-        direction_cam = self._normalize_vector3(tray_target.direction_unit)
-        velocity_cam_mmps = (
-            direction_cam[0] * speed_mmps,
-            direction_cam[1] * speed_mmps,
-            direction_cam[2] * speed_mmps,
-        )
-        raw_velocity_base_mmps = self._rotate_vector_by_quaternion(velocity_cam_mmps, q_base_camera)
-        velocity_base_mmps = (
-            raw_velocity_base_mmps[0],
-            raw_velocity_base_mmps[1],
-            0.0,
-        )
-        tray_speed_base_mmps = self._vector_norm3(velocity_base_mmps)
-        if tray_speed_base_mmps > 1e-6:
-            follow_direction_base_unit = self._normalize_vector3(velocity_base_mmps)
-        else:
-            follow_direction_base_unit = (0.0, 0.0, 0.0)
-
-        if predict_target_motion:
-            now_sec = float(self.get_clock().now().nanoseconds) * 1e-9
-            raw_age_sec = max(0.0, now_sec - max(0.0, float(tray_target.stamp_sec)))
-            tray_age_sec = (
-                raw_age_sec
-                + max(0.0, float(tray_target.decay_sec))
-                + max(0.0, float(self._command_hysteresis_sec))
-            )
-            tray_now_x = tray_base_x + (velocity_base_mmps[0] * tray_age_sec)
-            tray_now_y = tray_base_y + (velocity_base_mmps[1] * tray_age_sec)
-            tray_now_z = tray_base_z + (velocity_base_mmps[2] * tray_age_sec)
-        else:
-            tray_age_sec = 0.0
-            tray_now_x = tray_base_x
-            tray_now_y = tray_base_y
-            tray_now_z = tray_base_z
+        now_sec = float(self.get_clock().now().nanoseconds) * 1e-9
+        tray_age_sec = max(0.0, now_sec - max(0.0, float(tray_target.stamp_sec)))
 
         snapshot = self.snapshot()
         safe_z_offset_mm = max(POST_STOP_Z_OFFSET_MIN, float(z_offset_mm))
@@ -1090,38 +983,9 @@ class RelMovLMiniNode(Node):
             + (tray_local_y_in_base[1] * y_offset_mm),
             safe_z_offset_mm,
         )
-        desired_now_goal_mm = (
-            tray_now_x + stand_off_vec_base_mm[0],
-            tray_now_y + stand_off_vec_base_mm[1],
-            tray_now_z + stand_off_vec_base_mm[2],
-        )
-        tcp_now_mm = (
-            float(snapshot.tcp_values.get('x', 0.0)),
-            float(snapshot.tcp_values.get('y', 0.0)),
-            float(snapshot.tcp_values.get('z', 0.0)),
-        )
-        relative_goal_mm = (
-            desired_now_goal_mm[0] - tcp_now_mm[0],
-            desired_now_goal_mm[1] - tcp_now_mm[1],
-            desired_now_goal_mm[2] - tcp_now_mm[2],
-        )
-
-        if predict_target_motion:
-            ee_speed_limited_mmps = max(1.0, min(POST_STOP_MOVL_SPEED_MAX, float(ee_speed_mmps)))
-            lead_time_sec = self._solve_intercept_time_sec(
-                relative_goal_mm,
-                velocity_base_mmps,
-                ee_speed_limited_mmps,
-            )
-            if lead_time_sec is None:
-                lead_time_sec = self._vector_norm3(relative_goal_mm) / ee_speed_limited_mmps
-            lead_time_sec = max(0.0, min(self._tray_prediction_max_lead_sec, lead_time_sec))
-        else:
-            lead_time_sec = 0.0
-
-        target_x_goal = desired_now_goal_mm[0] + (velocity_base_mmps[0] * lead_time_sec)
-        target_y_goal = desired_now_goal_mm[1] + (velocity_base_mmps[1] * lead_time_sec)
-        target_z_goal = desired_now_goal_mm[2] + (velocity_base_mmps[2] * lead_time_sec)
+        target_x_goal = tray_base_x + stand_off_vec_base_mm[0]
+        target_y_goal = tray_base_y + stand_off_vec_base_mm[1]
+        target_z_goal = tray_base_z + stand_off_vec_base_mm[2]
 
         current_rx_deg = float(snapshot.tcp_values.get('rx', 0.0))
         current_ry_deg = float(snapshot.tcp_values.get('ry', 0.0))
@@ -1149,7 +1013,7 @@ class RelMovLMiniNode(Node):
         # is CCW, so subtract the operator's signed offset.
         goal_rz_deg = aligned_rz_deg - signed_ee_angle_deg
 
-        return PredictedGoal(
+        return StationaryGoal(
             x_mm=target_x_goal,
             y_mm=target_y_goal,
             z_mm=target_z_goal,
@@ -1157,17 +1021,14 @@ class RelMovLMiniNode(Node):
             ry_deg=goal_ry_deg,
             rz_deg=goal_rz_deg,
             source_frame_id=frame_id,
-            lead_time_sec=lead_time_sec,
             tray_age_sec=tray_age_sec,
-            tray_speed_base_mmps=tray_speed_base_mmps,
-            follow_direction_base_unit=follow_direction_base_unit,
             ee_angle_signed_deg=signed_ee_angle_deg,
             ee_angle_direction_label=ee_angle_direction_label,
         )
 
     def _compute_follow_and_post_z_up_goals(
         self,
-        base_goal: PredictedGoal,
+        base_goal: StationaryGoal,
         follow_distance_mm: float,
         post_follow_z_up_mm: float,
         post_z_up_speed_mm_s: float,
@@ -1176,21 +1037,21 @@ class RelMovLMiniNode(Node):
         tuple[float, float, float, float, float, float],
         float,
     ]:
-        post_z_up_speed_limited = max(LINEAR_SPEED_MM_S_MIN, min(POST_STOP_MOVL_SPEED_MAX, float(post_z_up_speed_mm_s)))
-        post_z_up_duration_sec = max(0.0, float(post_follow_z_up_mm)) / post_z_up_speed_limited
-        zup_follow_distance_mm = float(base_goal.tray_speed_base_mmps) * post_z_up_duration_sec
+        _ = follow_distance_mm
+        _ = post_z_up_speed_mm_s
+        zup_follow_distance_mm = 0.0
         follow_goal = (
-            base_goal.x_mm + (base_goal.follow_direction_base_unit[0] * follow_distance_mm),
-            base_goal.y_mm + (base_goal.follow_direction_base_unit[1] * follow_distance_mm),
-            base_goal.z_mm + (base_goal.follow_direction_base_unit[2] * follow_distance_mm),
+            base_goal.x_mm,
+            base_goal.y_mm,
+            base_goal.z_mm,
             base_goal.rx_deg,
             base_goal.ry_deg,
             base_goal.rz_deg,
         )
         post_follow_goal = (
-            follow_goal[0] + (base_goal.follow_direction_base_unit[0] * zup_follow_distance_mm),
-            follow_goal[1] + (base_goal.follow_direction_base_unit[1] * zup_follow_distance_mm),
-            follow_goal[2] + (base_goal.follow_direction_base_unit[2] * zup_follow_distance_mm) + post_follow_z_up_mm,
+            follow_goal[0],
+            follow_goal[1],
+            follow_goal[2] + post_follow_z_up_mm,
             follow_goal[3],
             follow_goal[4],
             follow_goal[5],
@@ -1526,7 +1387,7 @@ class RelMovLMiniNode(Node):
 
     def _preview_goal_only_request(
         self,
-        tray_target: TrayVectorTarget,
+        tray_target: TrayPoseTarget,
         x_offset_mm: float,
         y_offset_mm: float,
         z_offset_mm: float,
@@ -1535,7 +1396,6 @@ class RelMovLMiniNode(Node):
         ee_final_pose_angle_deg: float,
     ) -> None:
         try:
-            intercept_speed_mm_s = FIXED_EE_INTERCEPT_SPEED_MM_S
             post_z_up_speed_mm_s = POST_STOP_MOVL_SPEED_MAX
             self._set_action_text('Computing tray goal preview in base frame...')
             base_goal = self._compute_base_goal_from_tray_target(
@@ -1543,13 +1403,11 @@ class RelMovLMiniNode(Node):
                 x_offset_mm,
                 y_offset_mm,
                 z_offset_mm,
-                intercept_speed_mm_s,
                 ee_final_pose_angle_deg,
-                predict_target_motion=False,
             )
             if base_goal is None:
                 return
-            follow_goal, post_follow_goal, zup_follow_distance_mm = self._compute_follow_and_post_z_up_goals(
+            follow_goal, post_follow_goal, _ = self._compute_follow_and_post_z_up_goals(
                 base_goal,
                 follow_distance_mm,
                 post_follow_z_up_mm,
@@ -1587,11 +1445,10 @@ class RelMovLMiniNode(Node):
                 post_follow_goal[5],
             )
             self._set_action_text(
-                f'Previewed 3-stage goal from {base_goal.source_frame_id}: '
-                f'age={base_goal.tray_age_sec:.3f}s lead={base_goal.lead_time_sec:.3f}s '
-                f'tray_speed={base_goal.tray_speed_base_mmps:.1f} mm/s '
+                f'Previewed stationary tray goal from {base_goal.source_frame_id}: '
+                f'age={base_goal.tray_age_sec:.3f}s '
                 f'ee_angle={base_goal.ee_angle_signed_deg:.1f}deg/{base_goal.ee_angle_direction_label} '
-                f'z-up follow={zup_follow_distance_mm:.1f} mm. TF-only.'
+                f'z-up={post_follow_z_up_mm:.1f} mm. TF-only.'
             )
         except Exception as exc:
             self.get_logger().error(f'Preview goal computation failed: {exc}')
@@ -1601,24 +1458,24 @@ class RelMovLMiniNode(Node):
                 self._preview_inflight = False
             self._set_busy(False)
 
-    def _arm_tray_vector_watch_locked(self) -> int:
+    def _arm_tray_pose_watch_locked(self) -> int:
         self._tray_watch_generation += 1
         self._tray_watch_armed = True
-        self._tray_watch_seq_floor = self._tray_vector_seq
+        self._tray_watch_seq_floor = self._tray_target_pose_seq
         self._tray_watch_deadline_monotonic = (
             time.monotonic() + max(
-                TRAY_VECTOR_WATCH_TIMEOUT_MIN,
-                min(TRAY_VECTOR_WATCH_TIMEOUT_MAX, float(self._tray_vector_watch_timeout_sec)),
+                TRAY_TARGET_POSE_WATCH_TIMEOUT_MIN,
+                min(TRAY_TARGET_POSE_WATCH_TIMEOUT_MAX, float(self._tray_target_pose_watch_timeout_sec)),
             )
         )
         self._tray_watch_stop_dispatched = False
         return self._tray_watch_generation
 
-    def _tray_vector_watchdog_worker(self, generation: int) -> None:
+    def _tray_pose_watchdog_worker(self, generation: int) -> None:
         while rclpy.ok():
-            if self.count_publishers(self._tray_vector_topic) <= 0:
+            if self.count_publishers(self._tray_target_pose_topic) <= 0:
                 self._reset_runtime_state(
-                    f'No tray node detected on "{self._tray_vector_topic}". Node reset.'
+                    f'No tray target pose publisher detected on "{self._tray_target_pose_topic}". Node reset.'
                 )
                 return
             with self._lock:
@@ -1629,18 +1486,18 @@ class RelMovLMiniNode(Node):
                 remaining_sec = self._tray_watch_deadline_monotonic - time.monotonic()
                 if remaining_sec <= 0.0:
                     watch_timeout_sec = max(
-                        TRAY_VECTOR_WATCH_TIMEOUT_MIN,
-                        min(TRAY_VECTOR_WATCH_TIMEOUT_MAX, float(self._tray_vector_watch_timeout_sec)),
+                        TRAY_TARGET_POSE_WATCH_TIMEOUT_MIN,
+                        min(TRAY_TARGET_POSE_WATCH_TIMEOUT_MAX, float(self._tray_target_pose_watch_timeout_sec)),
                     )
                     self._reset_runtime_state_locked(
-                        f'No tray vector within {watch_timeout_sec:.0f}s. Node reset.'
+                        f'No tray target pose within {watch_timeout_sec:.0f}s. Node reset.'
                     )
                     return
             time.sleep(min(0.1, max(0.02, remaining_sec)))
 
     def _send_stop_and_movel_request(
         self,
-        tray_target: TrayVectorTarget,
+        tray_target: TrayPoseTarget,
         x_offset_mm: float,
         y_offset_mm: float,
         z_offset_mm: float,
@@ -1682,7 +1539,6 @@ class RelMovLMiniNode(Node):
                 x_offset_mm,
                 y_offset_mm,
                 z_offset_mm,
-                intercept_speed_mm_s,
                 ee_final_pose_angle_deg,
             )
             if base_goal is None:
@@ -1698,10 +1554,7 @@ class RelMovLMiniNode(Node):
                 post_follow_z_up_mm,
                 post_z_up_speed_mm_s,
             )
-            follow_speed_mm_s = max(
-                LINEAR_SPEED_MM_S_MIN,
-                min(POST_STOP_MOVL_SPEED_MAX, float(base_goal.tray_speed_base_mmps)),
-            )
+            follow_speed_mm_s = LINEAR_SPEED_MM_S_MIN
 
             snapshot = self.snapshot()
             current_pose = (
@@ -1791,9 +1644,14 @@ class RelMovLMiniNode(Node):
                     follow_speed_mm_s,
                 )
                 follow_mdis = self._build_release_follow_mdis(exhaust_off_distance_percent)
-            if release_without_follow_motion:
+            if follow_translation_mm <= TRAY_RELEASE_NO_MOTION_TOLERANCE_MM and not release_grip_enabled:
+                follow_ok = True
+                follow_v = 0
+                follow_map = 'stationary_no_follow'
+                follow_cmd = 'none'
+            elif release_without_follow_motion:
                 self._set_action_text(
-                    'Static tray release: waiting for intercept pose before opening gripper...'
+                    'Static tray release: waiting for target pose before opening gripper...'
                 )
                 if not self._wait_for_tcp_xyz_goal(
                     (intercept_goal[0], intercept_goal[1], intercept_goal[2])
@@ -1810,7 +1668,7 @@ class RelMovLMiniNode(Node):
                     follow_goal,
                     intercept_goal,
                     follow_speed_mm_s,
-                    'MovLIO follow tray direction + release IO',
+                    'MovLIO stationary release + release IO',
                     mdis=follow_mdis,
                 )
                 follow_cmd = 'MovLIO'
@@ -1819,7 +1677,7 @@ class RelMovLMiniNode(Node):
                     follow_goal,
                     intercept_goal,
                     follow_speed_mm_s,
-                    'MovL follow tray direction',
+                    'MovL stationary target hold',
                 )
                 follow_cmd = 'MovL'
             if not follow_ok:
@@ -1846,7 +1704,7 @@ class RelMovLMiniNode(Node):
                     post_follow_goal,
                     follow_goal,
                     post_z_up_speed_mm_s,
-                    'MovLIO post-follow z-up + release IO',
+                    'MovLIO stationary post-target z-up + release IO',
                     mdis=zup_mdis,
                 )
                 zup_cmd = 'MovLIO'
@@ -1855,7 +1713,7 @@ class RelMovLMiniNode(Node):
                     post_follow_goal,
                     follow_goal,
                     post_z_up_speed_mm_s,
-                    'MovL post-follow z-up + tray follow',
+                    'MovL stationary post-target z-up',
                 )
                 zup_cmd = 'MovL'
             if not zup_ok:
@@ -1874,21 +1732,19 @@ class RelMovLMiniNode(Node):
                 return
 
             self.get_logger().info(
-                f'Completed queued tray sequence (MovL intercept + {follow_cmd} follow + {zup_cmd} post-follow): '
-                f'intercept offsets (X {x_offset_mm:.0f}, Y {y_offset_mm:.0f}, Z {z_offset_mm:.0f} mm), '
-                f'intercept {intercept_speed_mm_s:.0f} mm/s, follow {follow_distance_mm:.0f} mm '
-                f'at tray speed {follow_speed_mm_s:.0f} mm/s, '
-                f'post Z-up {post_follow_z_up_mm:.0f} mm with tray-follow {zup_follow_distance_mm:.1f} mm. '
+                f'Completed queued stationary tray sequence (MovL target + {follow_cmd} release/hold + {zup_cmd} Z-up): '
+                f'tray offsets (X {x_offset_mm:.0f}, Y {y_offset_mm:.0f}, Z {z_offset_mm:.0f} mm), '
+                f'target {intercept_speed_mm_s:.0f} mm/s, stationary follow {follow_translation_mm:.1f} mm, '
+                f'post Z-up {post_follow_z_up_mm:.0f} mm. '
                 f'ee_angle={base_goal.ee_angle_signed_deg:.1f}deg/{base_goal.ee_angle_direction_label} '
                 f'release_grip={"on" if release_grip_enabled else "off"} '
-                f'age={base_goal.tray_age_sec:.3f}s lead={base_goal.lead_time_sec:.3f}s '
-                f'tray_speed={base_goal.tray_speed_base_mmps:.1f} mm/s '
-                f'(v: intercept={intercept_v}/{intercept_map}, '
+                f'pose_age={base_goal.tray_age_sec:.3f}s '
+                f'(v: target={intercept_v}/{intercept_map}, '
                 f'follow={follow_v}/{follow_map}, z-up={zup_v}/{zup_map}).'
             )
         except Exception as exc:
-            self.get_logger().error(f'MovL predicted-goal flow failed: {exc}')
-            self._set_action_text(f'MovL predicted-goal flow failed: {exc}')
+            self.get_logger().error(f'MovL stationary-goal flow failed: {exc}')
+            self._set_action_text(f'MovL stationary-goal flow failed: {exc}')
         finally:
             if not seek_complete_notified:
                 self._notify_tray_detect_seek_complete()
@@ -1922,7 +1778,7 @@ class RelMovLMiniNode(Node):
         with self._lock:
             response.started = bool(started)
             response.message = str(self._snapshot.action_text)
-            response.applied_tray_vector_wait_timeout_sec = float(self._tray_vector_watch_timeout_sec)
+            response.applied_tray_vector_wait_timeout_sec = float(self._tray_target_pose_watch_timeout_sec)
             response.applied_ee_intercept_speed_mm_s = float(self._post_stop_movel_speed_mm_s)
             response.applied_tray_intercept_x_offset_mm = float(self._post_stop_x_offset_mm)
             response.applied_tray_intercept_y_offset_mm = float(self._post_stop_y_offset_mm)
@@ -1972,7 +1828,7 @@ class RelMovLMiniNode(Node):
 
         response.success = armed
         if armed:
-            response.message = f'Track armed: waiting for "{self._tray_vector_topic}". {action_text}'
+            response.message = f'Track armed: waiting for "{self._tray_target_pose_topic}". {action_text}'
         elif busy:
             response.message = f'Track busy but not armed. {action_text}'
         else:
@@ -1981,7 +1837,8 @@ class RelMovLMiniNode(Node):
 
     def run_track_from_current_settings(self) -> bool:
         with self._lock:
-            tray_vector_watch_timeout_sec = float(self._tray_vector_watch_timeout_sec)
+            tray_target_pose_watch_timeout_sec = float(self._tray_target_pose_watch_timeout_sec)
+            post_stop_movel_speed_mm_s = float(self._post_stop_movel_speed_mm_s)
             post_stop_x_offset_mm = float(self._post_stop_x_offset_mm)
             post_stop_y_offset_mm = float(self._post_stop_y_offset_mm)
             post_stop_z_offset_mm = float(self._post_stop_z_offset_mm)
@@ -1991,7 +1848,7 @@ class RelMovLMiniNode(Node):
             ee_final_pose_angle_deg = float(self._ee_final_pose_angle_deg)
 
         return self.run_tray_sequence(
-            tray_vector_watch_timeout_sec,
+            tray_target_pose_watch_timeout_sec,
             post_stop_movel_speed_mm_s,
             post_stop_x_offset_mm,
             post_stop_y_offset_mm,
@@ -2274,11 +2131,11 @@ class RelMovLMiniNode(Node):
 
         with self._lock:
             self._tray_watch_tf_only_mode = bool(payload.get('tf_only_mode', self._tray_watch_tf_only_mode))
-            self._tray_vector_watch_timeout_sec = self._clamp_float(
-                payload.get('tray_vector_wait_timeout_sec', self._tray_vector_watch_timeout_sec),
-                TRAY_VECTOR_WATCH_TIMEOUT_MIN,
-                TRAY_VECTOR_WATCH_TIMEOUT_MAX,
-                self._tray_vector_watch_timeout_sec,
+            self._tray_target_pose_watch_timeout_sec = self._clamp_float(
+                payload.get('tray_vector_wait_timeout_sec', self._tray_target_pose_watch_timeout_sec),
+                TRAY_TARGET_POSE_WATCH_TIMEOUT_MIN,
+                TRAY_TARGET_POSE_WATCH_TIMEOUT_MAX,
+                self._tray_target_pose_watch_timeout_sec,
             )
             self._post_stop_movel_speed_mm_s = self._clamp_float(
                 payload.get('ee_intercept_speed_mm_s', self._post_stop_movel_speed_mm_s),
@@ -2346,7 +2203,7 @@ class RelMovLMiniNode(Node):
 
     def run_tray_sequence(
         self,
-        tray_vector_watch_timeout_sec: float,
+        tray_target_pose_watch_timeout_sec: float,
         post_stop_movel_speed_mm_s: float,
         post_stop_x_offset_mm: float,
         post_stop_y_offset_mm: float,
@@ -2356,9 +2213,9 @@ class RelMovLMiniNode(Node):
         tf_only_mode: bool,
         ee_final_pose_angle_deg: float | None = None,
     ) -> bool:
-        if self.count_publishers(self._tray_vector_topic) <= 0:
+        if self.count_publishers(self._tray_target_pose_topic) <= 0:
             self._reset_runtime_state(
-                f'No tray node detected on "{self._tray_vector_topic}". Node reset.'
+                f'No tray target pose publisher detected on "{self._tray_target_pose_topic}". Node reset.'
             )
             return False
 
@@ -2369,9 +2226,9 @@ class RelMovLMiniNode(Node):
                 return False
             self._snapshot.busy = True
             self._cancel_requested = False
-            self._tray_vector_watch_timeout_sec = max(
-                TRAY_VECTOR_WATCH_TIMEOUT_MIN,
-                min(TRAY_VECTOR_WATCH_TIMEOUT_MAX, float(tray_vector_watch_timeout_sec)),
+            self._tray_target_pose_watch_timeout_sec = max(
+                TRAY_TARGET_POSE_WATCH_TIMEOUT_MIN,
+                min(TRAY_TARGET_POSE_WATCH_TIMEOUT_MAX, float(tray_target_pose_watch_timeout_sec)),
             )
             self._post_stop_movel_speed_mm_s = FIXED_EE_INTERCEPT_SPEED_MM_S
             if ee_final_pose_angle_deg is not None:
@@ -2400,8 +2257,8 @@ class RelMovLMiniNode(Node):
                 min(POST_FOLLOW_Z_UP_MAX, float(post_follow_z_up_mm)),
             )
             self._tray_watch_tf_only_mode = bool(tf_only_mode)
-            generation = self._arm_tray_vector_watch_locked()
-            watch_timeout_sec = float(self._tray_vector_watch_timeout_sec)
+            generation = self._arm_tray_pose_watch_locked()
+            watch_timeout_sec = float(self._tray_target_pose_watch_timeout_sec)
             mode_name = 'tf_only' if tf_only_mode else 'normal'
             self.get_logger().info(
                 'Run settings: '
@@ -2420,17 +2277,17 @@ class RelMovLMiniNode(Node):
             )
             if tf_only_mode:
                 self._snapshot.action_text = (
-                    f'Troubleshoot mode armed... waiting for "{self._tray_vector_topic}" '
+                    f'Troubleshoot mode armed... waiting for "{self._tray_target_pose_topic}" '
                     f'for {watch_timeout_sec:.0f}s (TF preview only).'
                 )
             else:
                 self._snapshot.action_text = (
-                    f'Tray sequence armed... waiting for "{self._tray_vector_topic}" '
+                    f'Tray sequence armed... waiting for "{self._tray_target_pose_topic}" '
                     f'for {watch_timeout_sec:.0f}s.'
                 )
 
         watchdog = threading.Thread(
-            target=self._tray_vector_watchdog_worker,
+            target=self._tray_pose_watchdog_worker,
             args=(generation,),
             daemon=True,
         )
@@ -2773,12 +2630,12 @@ class RelMovLMiniGui:
         self._tf_only_default_active_fg = self.tf_only_button.cget('activeforeground')
         self._sync_tf_only_button(is_busy=False)
 
-        tk.Label(modes_frame, text='Tray vector wait timeout (sec)').grid(row=3, column=0, sticky='w', pady=(10, 0))
-        self.tray_watch_timeout_var = tk.DoubleVar(value=TRAY_VECTOR_WATCH_TIMEOUT_SEC)
+        tk.Label(modes_frame, text='Tray target pose wait timeout (sec)').grid(row=3, column=0, sticky='w', pady=(10, 0))
+        self.tray_watch_timeout_var = tk.DoubleVar(value=TRAY_TARGET_POSE_WATCH_TIMEOUT_SEC)
         self.tray_watch_timeout_scale = tk.Scale(
             modes_frame,
-            from_=TRAY_VECTOR_WATCH_TIMEOUT_MIN,
-            to=TRAY_VECTOR_WATCH_TIMEOUT_MAX,
+            from_=TRAY_TARGET_POSE_WATCH_TIMEOUT_MIN,
+            to=TRAY_TARGET_POSE_WATCH_TIMEOUT_MAX,
             orient=tk.HORIZONTAL,
             resolution=1.0,
             length=280,
@@ -2788,8 +2645,8 @@ class RelMovLMiniGui:
         self.tray_watch_timeout_scale.grid(row=4, column=0, sticky='ew')
 
         mode_hint = (
-            'Press Arm Track Tray, then wait for tray vector. '
-            'Normal mode queues Stop + MovL intercept, then MovL/MovLIO follow and post-follow.'
+            'Press Arm Track Tray, then wait for tray target pose. '
+            'Normal mode queues Stop + MovL target, then stationary release/hold and post-target Z-up.'
         )
         tk.Label(
             modes_frame,
@@ -3279,9 +3136,9 @@ class RelMovLMiniGui:
         try:
             self.tf_only_var.set(bool(payload.get('tf_only_mode', True)))
             self.tray_watch_timeout_var.set(self._clamp(
-                payload.get('tray_vector_wait_timeout_sec', TRAY_VECTOR_WATCH_TIMEOUT_SEC),
-                TRAY_VECTOR_WATCH_TIMEOUT_MIN,
-                TRAY_VECTOR_WATCH_TIMEOUT_MAX,
+                payload.get('tray_vector_wait_timeout_sec', TRAY_TARGET_POSE_WATCH_TIMEOUT_SEC),
+                TRAY_TARGET_POSE_WATCH_TIMEOUT_MIN,
+                TRAY_TARGET_POSE_WATCH_TIMEOUT_MAX,
             ))
             self.ee_final_pose_angle_var.set(self._clamp(
                 payload.get('ee_final_pose_angle_deg', EE_FINAL_POSE_ANGLE_DEFAULT_DEG),

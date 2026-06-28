@@ -35,7 +35,6 @@
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <std_srvs/srv/set_bool.hpp>
-#include <dobot_msgs_v4/msg/tray_vector.hpp>
 #include <dobot_msgs_v4/srv/get_tray_dimensions.hpp>
 #include <dobot_msgs_v4/srv/mov_j.hpp>
 #include <std_srvs/srv/trigger.hpp>
@@ -54,7 +53,6 @@ using MovJSrv = dobot_msgs_v4::srv::MovJ;
 using GetTrayDimensionsSrv = dobot_msgs_v4::srv::GetTrayDimensions;
 using PoseStampedMsg = geometry_msgs::msg::PoseStamped;
 using PolygonStampedMsg = geometry_msgs::msg::PolygonStamped;
-using TrayVectorMsg = dobot_msgs_v4::msg::TrayVector;
 using MarkerMsg = visualization_msgs::msg::Marker;
 using TriggerSrv = std_srvs::srv::Trigger;
 using SetBoolSrv = std_srvs::srv::SetBool;
@@ -304,10 +302,11 @@ struct SeekCapture
   cv::Mat frame;
 };
 
-struct SeekMotionSample
+struct SeekPoseAverageResult
 {
-  rclcpp::Time stamp {0, 0, RCL_ROS_TIME};
   TrayPose3D pose;
+  std::size_t raw_sample_count {0};
+  std::size_t inlier_sample_count {0};
 };
 
 struct TimedTrayEstimate
@@ -4017,8 +4016,8 @@ public:
         depth_exposure_max_us_);
       depth_exposure_us_ = 0;
       tray_pose_topic_ = declare_parameter<std::string>("tray_pose_topic", "tray_pose");
+    tray_target_pose_topic_ = declare_parameter<std::string>("tray_target_pose_topic", "tray_target_pose");
     tray_axis_overlay_topic_ = declare_parameter<std::string>("tray_axis_overlay_topic", "tray_axis_overlay");
-    tray_vector_topic_ = declare_parameter<std::string>("tray_vector_topic", "tray_vector");
     tray_cube_marker_topic_ = declare_parameter<std::string>("tray_cube_marker_topic", "tray_cube_marker");
     tray_dimensions_service_name_ = declare_parameter<std::string>(
       "tray_dimensions_service",
@@ -4056,7 +4055,6 @@ public:
       use_calibration_ ? calibration_child_frame_ : std::string("");
     camera_frame_id_ = declare_parameter<std::string>("camera_frame", default_camera_frame);
     tray_frame_id_ = declare_parameter<std::string>("tray_frame_id", "tray");
-    motion_update_period_sec_ = declare_parameter<double>("motion_update_period_sec", 0.1);
     pose_filter_window_sec_ = std::max(
       0.1,
       declare_parameter<double>("pose_filter_window_sec", 0.8));
@@ -4077,7 +4075,7 @@ public:
     const double seek_decay_sec = declare_parameter<double>("seek_decay_sec", 1.0);
     seek_decay_tenths_ = std::clamp(static_cast<int>(std::round(seek_decay_sec * 10.0)), 1, 10);
     seek_valid_confidence_frames_ = std::clamp(
-      static_cast<int>(declare_parameter<int>("seek_valid_frames_confidence", 5)),
+      static_cast<int>(declare_parameter<int>("seek_valid_frames_confidence", 10)),
       2,
       30);
     seek_snapshots_dir_ = declare_parameter<std::string>(
@@ -4172,10 +4170,6 @@ public:
     tray_width_mm_ = declare_double_param("tray_width_mm", 0.0);
     tray_height_mm_ = declare_double_param("tray_height_mm", 0.0);
     dimension_tolerance_percent_ = declare_parameter<int>("tray_dimension_tolerance_percent", 15);
-    if (motion_update_period_sec_ <= 0.0)
-    {
-      motion_update_period_sec_ = 0.1;
-    }
     if (use_calibration_)
     {
       if (calibration_file_.empty() && auto_discover_calibration_)
@@ -4248,13 +4242,13 @@ public:
 
     RCLCPP_INFO(
       get_logger(),
-      "Tray detect ready. Overlay topic=%s tray_pose topic=%s tray_vector topic=%s tray_cube_marker topic=%s "
+      "Tray detect ready. Overlay topic=%s tray_pose topic=%s tray_target_pose topic=%s tray_cube_marker topic=%s "
       "(enabled=%s thickness=%.1fmm) detect_mode=%s tray_plane=%s "
       "z_axis=natural_edge base_frame=%s pose_filter=window %.2fs min=%d z<=%.1fmm ang<=%.1fdeg movj_service=%s seek_service=%s go_to_teach_service=%s "
       "selected_profile=%s profiles=%zu headless=%s",
       overlay_topic_.c_str(),
       tray_pose_topic_.c_str(),
-      tray_vector_topic_.c_str(),
+      tray_target_pose_topic_.c_str(),
       tray_cube_marker_topic_.c_str(),
       publish_tray_cube_marker_ ? "true" : "false",
       tray_thickness_mm_,
@@ -4353,52 +4347,13 @@ private:
     }
   }
 
-  struct SeekVectorSummary
+  struct SeekPoseSummary
   {
     bool has_value {false};
-    cv::Vec3d delta_m {0.0, 0.0, 0.0};
-    double delta_t_sec {0.0};
+    cv::Vec3d averaged_position_m {0.0, 0.0, 0.0};
+    std::size_t raw_sample_count {0};
+    std::size_t inlier_sample_count {0};
   };
-
-  struct SeekMotionData
-  {
-    double dt_sec {0.0};
-    cv::Vec3d delta_position_mm {0.0, 0.0, 0.0};
-    cv::Vec3d velocity_camera_mmps {0.0, 0.0, 0.0};
-    double speed_camera_mmps {0.0};
-    cv::Vec3d direction_camera {0.0, 0.0, 0.0};
-    cv::Vec3d velocity_child_mmps {0.0, 0.0, 0.0};
-    double speed_child_mmps {0.0};
-    cv::Vec3d direction_child {0.0, 0.0, 0.0};
-  };
-
-  SeekMotionData buildSeekMotionData(
-    const cv::Vec3d &delta_position_m,
-    double dt_sec,
-    const cv::Matx33d &last_pose_rotation) const
-  {
-    SeekMotionData data;
-    data.dt_sec = std::max(0.0, dt_sec);
-    const cv::Vec3d velocity_camera_mps = data.dt_sec > 1e-6
-      ? (delta_position_m * (1.0 / data.dt_sec))
-      : cv::Vec3d(0.0, 0.0, 0.0);
-    const cv::Vec3d velocity_child_mps = last_pose_rotation.t() * velocity_camera_mps;
-    const double speed_camera_mps = cv::norm(velocity_camera_mps);
-    const double speed_child_mps = cv::norm(velocity_child_mps);
-
-    data.delta_position_mm = delta_position_m * kMetersToMillimeters;
-    data.velocity_camera_mmps = velocity_camera_mps * kMetersToMillimeters;
-    data.velocity_child_mmps = velocity_child_mps * kMetersToMillimeters;
-    data.speed_camera_mmps = speed_camera_mps * kMetersToMillimeters;
-    data.speed_child_mmps = speed_child_mps * kMetersToMillimeters;
-    data.direction_camera = speed_camera_mps > 1e-9
-      ? (velocity_camera_mps * (1.0 / speed_camera_mps))
-      : cv::Vec3d(0.0, 0.0, 0.0);
-    data.direction_child = speed_child_mps > 1e-9
-      ? (velocity_child_mps * (1.0 / speed_child_mps))
-      : cv::Vec3d(0.0, 0.0, 0.0);
-    return data;
-  }
 
   static std::string defaultCalibrationDir()
   {
@@ -4740,12 +4695,12 @@ private:
 
     void createRosInterfaces()
     {
-    overlay_pub_ = create_publisher<ImageMsg>(overlay_topic_, rclcpp::QoS(5));
-    tray_pose_pub_ = create_publisher<PoseStampedMsg>(tray_pose_topic_, rclcpp::QoS(10));
-    tray_axis_overlay_pub_ = create_publisher<PolygonStampedMsg>(tray_axis_overlay_topic_, rclcpp::QoS(10));
-    tray_vector_pub_ = create_publisher<TrayVectorMsg>(
-      tray_vector_topic_,
-      rclcpp::QoS(1).reliable().transient_local());
+	    overlay_pub_ = create_publisher<ImageMsg>(overlay_topic_, rclcpp::QoS(5));
+	    tray_pose_pub_ = create_publisher<PoseStampedMsg>(tray_pose_topic_, rclcpp::QoS(10));
+	    tray_axis_overlay_pub_ = create_publisher<PolygonStampedMsg>(tray_axis_overlay_topic_, rclcpp::QoS(10));
+	    tray_target_pose_pub_ = create_publisher<PoseStampedMsg>(
+	      tray_target_pose_topic_,
+	      rclcpp::QoS(1).reliable().transient_local());
     tray_cube_marker_pub_ = create_publisher<MarkerMsg>(
       tray_cube_marker_topic_,
       rclcpp::QoS(1).reliable().transient_local());
@@ -4838,10 +4793,10 @@ private:
 
     seek_mode_active_ = true;
     seek_result_latched_ = false;
-    seek_vector_summary_.has_value = false;
+    seek_pose_summary_.has_value = false;
     resetSeekSessionState();
     profile_status_message_ = cv::format(
-      "Seek armed: waiting for tray vector publish (%.1fs window, %.1fs decay, %d valid frames)",
+      "Seek armed: waiting for averaged tray pose publish (%.1fs window, %.1fs decay, %d valid frames)",
       seekWindowSeconds(),
       seekDecaySeconds(),
       seek_valid_confidence_frames_);
@@ -5156,7 +5111,7 @@ private:
     if (
       recreate_interfaces &&
       (
-        topics_changed || !overlay_pub_ || !tray_pose_pub_ || !tray_axis_overlay_pub_ || !tray_vector_pub_ ||
+        topics_changed || !overlay_pub_ || !tray_pose_pub_ || !tray_axis_overlay_pub_ || !tray_target_pose_pub_ ||
         !color_sub_ || !depth_sub_ || !camera_info_sub_))
     {
       createRosInterfaces();
@@ -5176,7 +5131,7 @@ private:
       static_cast<bool>(overlay_pub_) ||
       static_cast<bool>(tray_pose_pub_) ||
       static_cast<bool>(tray_axis_overlay_pub_) ||
-      static_cast<bool>(tray_vector_pub_) ||
+	      static_cast<bool>(tray_target_pose_pub_) ||
       static_cast<bool>(color_sub_) ||
       static_cast<bool>(depth_sub_) ||
       static_cast<bool>(camera_info_sub_);
@@ -5708,9 +5663,9 @@ private:
     const int panel_total_width = std::max(360, width - 2 * margin);
     const int panel_col_width = std::max(120, (panel_total_width - 2 * panel_gap) / 3);
 
-    seek_vector_panel_rect_ = cv::Rect(margin, panel_y, panel_col_width, panel_height);
+    seek_pose_panel_rect_ = cv::Rect(margin, panel_y, panel_col_width, panel_height);
     seek_controls_panel_rect_ = cv::Rect(
-      seek_vector_panel_rect_.x + seek_vector_panel_rect_.width + panel_gap,
+      seek_pose_panel_rect_.x + seek_pose_panel_rect_.width + panel_gap,
       panel_y,
       panel_col_width,
       panel_height);
@@ -5726,15 +5681,15 @@ private:
       28);
 
     const int panel_pad = 12;
-    seek_vector_label_origin_ = cv::Point(
-      seek_vector_panel_rect_.x + panel_pad,
-      seek_vector_panel_rect_.y + 43);
-    seek_vector_value_origin_ = cv::Point(
-      seek_vector_panel_rect_.x + panel_pad,
-      seek_vector_panel_rect_.y + 64);
-    seek_vector_time_origin_ = cv::Point(
-      seek_vector_panel_rect_.x + panel_pad,
-      seek_vector_panel_rect_.y + 82);
+    seek_pose_label_origin_ = cv::Point(
+      seek_pose_panel_rect_.x + panel_pad,
+      seek_pose_panel_rect_.y + 43);
+    seek_pose_value_origin_ = cv::Point(
+      seek_pose_panel_rect_.x + panel_pad,
+      seek_pose_panel_rect_.y + 64);
+    seek_pose_time_origin_ = cv::Point(
+      seek_pose_panel_rect_.x + panel_pad,
+      seek_pose_panel_rect_.y + 82);
 
     seek_window_label_origin_ = cv::Point(
       seek_controls_panel_rect_.x + panel_pad,
@@ -5936,113 +5891,90 @@ private:
     return static_cast<double>(seek_decay_tenths_) * 0.1;
   }
 
-  void updateSeekVectorSummary(const SeekMotionData &motion)
+  void updateSeekPoseSummary(const SeekPoseAverageResult &average)
   {
-    seek_vector_summary_.has_value = true;
-    seek_vector_summary_.delta_m = motion.delta_position_mm * (1.0 / kMetersToMillimeters);
-    seek_vector_summary_.delta_t_sec = motion.dt_sec;
+    seek_pose_summary_.has_value = true;
+    seek_pose_summary_.averaged_position_m = average.pose.origin;
+    seek_pose_summary_.raw_sample_count = average.raw_sample_count;
+    seek_pose_summary_.inlier_sample_count = average.inlier_sample_count;
   }
 
-  SeekMotionData computeSeekMotionData(const SeekCapture &first_capture, const SeekCapture &last_capture) const
+  std::optional<SeekPoseAverageResult> averageSeekPoseSamples() const
   {
-    const cv::Vec3d delta_position_m = last_capture.pose.origin - first_capture.pose.origin;
-    const int64_t dt_ns = last_capture.stamp.nanoseconds() - first_capture.stamp.nanoseconds();
-    const double dt_sec = std::max(0.0, static_cast<double>(dt_ns) * 1e-9);
-    return buildSeekMotionData(delta_position_m, dt_sec, last_capture.pose.rotation);
+    if (seek_valid_pose_samples_.empty())
+    {
+      return std::nullopt;
+    }
+
+    const auto reference_pose = averageTimedTrayPoses(seek_valid_pose_samples_);
+    if (!reference_pose.has_value())
+    {
+      return std::nullopt;
+    }
+
+    const double position_threshold_m = pose_outlier_position_mm_ / kMetersToMillimeters;
+    const cv::Vec3d reference_x = rotationColumn(reference_pose->rotation, 0);
+    const cv::Vec3d reference_z = rotationColumn(reference_pose->rotation, 2);
+    std::deque<TimedTrayPose3D> inliers;
+    for (const auto &sample : seek_valid_pose_samples_)
+    {
+      const double position_error_m = cv::norm(sample.pose.origin - reference_pose->origin);
+      const cv::Vec3d sample_x = rotationColumn(sample.pose.rotation, 0);
+      const cv::Vec3d sample_z = rotationColumn(sample.pose.rotation, 2);
+      const double x_angle_error_deg = angleBetweenVectorsDeg(sample_x, reference_x);
+      const double z_angle_error_deg = angleBetweenVectorsDeg(sample_z, reference_z);
+      if (
+        position_error_m <= position_threshold_m &&
+        x_angle_error_deg <= pose_outlier_angle_deg_ &&
+        z_angle_error_deg <= pose_outlier_angle_deg_)
+      {
+        inliers.push_back(sample);
+      }
+    }
+
+    const std::size_t majority_count =
+      static_cast<std::size_t>(std::ceil(static_cast<double>(seek_valid_pose_samples_.size()) * 0.5));
+    const std::size_t required_inliers = std::min(
+      seek_valid_pose_samples_.size(),
+      std::max(
+        std::size_t{2},
+        std::max(static_cast<std::size_t>(pose_filter_min_samples_), majority_count)));
+    if (inliers.size() < required_inliers)
+    {
+      return std::nullopt;
+    }
+
+    const auto averaged_pose = averageTimedTrayPoses(inliers);
+    if (!averaged_pose.has_value())
+    {
+      return std::nullopt;
+    }
+
+    return SeekPoseAverageResult{
+      *averaged_pose,
+      seek_valid_pose_samples_.size(),
+      inliers.size(),
+    };
   }
 
-  SeekMotionData computeSeekMotionData(const std::deque<SeekMotionSample> &samples) const
+  bool publishSeekTargetPose(
+    const rclcpp::Time &stamp,
+    const std::string &frame_id,
+    const TrayPose3D &pose)
   {
-    if (samples.size() < 2)
-    {
-      return SeekMotionData{};
-    }
-
-    SeekCapture first_capture;
-    first_capture.stamp = samples.front().stamp;
-    first_capture.pose = samples.front().pose;
-    SeekCapture last_capture;
-    last_capture.stamp = samples.back().stamp;
-    last_capture.pose = samples.back().pose;
-
-    const double dt_total_sec = std::max(0.0, (samples.back().stamp - samples.front().stamp).seconds());
-    if (dt_total_sec <= 1e-6)
-    {
-      return computeSeekMotionData(first_capture, last_capture);
-    }
-
-    const double sample_count = static_cast<double>(samples.size());
-    double sum_t = 0.0;
-    double sum_t2 = 0.0;
-    cv::Vec3d sum_p(0.0, 0.0, 0.0);
-    cv::Vec3d sum_tp(0.0, 0.0, 0.0);
-    const rclcpp::Time t0 = samples.front().stamp;
-
-    for (const auto &sample : samples)
-    {
-      const double t_sec = std::max(0.0, (sample.stamp - t0).seconds());
-      sum_t += t_sec;
-      sum_t2 += t_sec * t_sec;
-      sum_p += sample.pose.origin;
-      sum_tp += sample.pose.origin * t_sec;
-    }
-
-    const double denominator = sample_count * sum_t2 - sum_t * sum_t;
-    if (std::fabs(denominator) <= 1e-12)
-    {
-      return computeSeekMotionData(first_capture, last_capture);
-    }
-
-    const cv::Vec3d velocity_camera_mps = (sum_tp * sample_count - sum_p * sum_t) * (1.0 / denominator);
-    const cv::Vec3d delta_position_m = velocity_camera_mps * dt_total_sec;
-    return buildSeekMotionData(delta_position_m, dt_total_sec, samples.back().pose.rotation);
-  }
-
-  bool publishSeekVectorData(
-    const SeekCapture &last_capture,
-    const SeekMotionData &motion,
-    double decay_sec)
-  {
-    if (!tray_vector_pub_)
+    if (!tray_target_pose_pub_)
     {
       return false;
     }
-    const cv::Vec3d position_mm = last_capture.pose.origin * kMetersToMillimeters;
-    const cv::Vec3d rpy_deg = rotationToRpyDegrees(last_capture.pose.rotation);
 
-    TrayVectorMsg msg;
-    msg.header.stamp = toBuiltinTime(last_capture.stamp);
-    msg.header.frame_id = !last_capture.frame_id.empty()
-      ? last_capture.frame_id
-      : (!camera_frame_id_.empty() ? camera_frame_id_ : std::string("camera_color_optical_frame"));
-    msg.first_stamp = toBuiltinTime(seek_first_valid_capture_.has_value() ? seek_first_valid_capture_->stamp : last_capture.stamp);
-    msg.last_stamp = toBuiltinTime(last_capture.stamp);
-    msg.dt_sec = motion.dt_sec;
-    msg.decay_sec = std::max(0.0, decay_sec);
-    msg.position_mm.x = position_mm[0];
-    msg.position_mm.y = position_mm[1];
-    msg.position_mm.z = position_mm[2];
-    msg.rpy_deg.x = rpy_deg[0];
-    msg.rpy_deg.y = rpy_deg[1];
-    msg.rpy_deg.z = rpy_deg[2];
-    // Sterilize tray motion vector in Z: publish XY-only motion components.
-    const cv::Vec3d planar_velocity_camera_mmps(
-      motion.velocity_camera_mmps[0],
-      motion.velocity_camera_mmps[1],
-      0.0);
-    const double planar_speed_mmps = cv::norm(planar_velocity_camera_mmps);
-    const cv::Vec3d planar_direction_camera = planar_speed_mmps > 1e-9
-      ? (planar_velocity_camera_mmps * (1.0 / planar_speed_mmps))
-      : cv::Vec3d(0.0, 0.0, 0.0);
-
-    msg.velocity_mmps.x = planar_velocity_camera_mmps[0];
-    msg.velocity_mmps.y = planar_velocity_camera_mmps[1];
-    msg.velocity_mmps.z = 0.0;
-    msg.speed_mmps = planar_speed_mmps;
-    msg.direction_unit.x = planar_direction_camera[0];
-    msg.direction_unit.y = planar_direction_camera[1];
-    msg.direction_unit.z = 0.0;
-    tray_vector_pub_->publish(msg);
+    PoseStampedMsg msg;
+    msg.header.stamp = toBuiltinTime(stamp);
+    msg.header.frame_id = frame_id.empty() ? "camera_color_optical_frame" : frame_id;
+    msg.pose.position.x = pose.origin[0];
+    msg.pose.position.y = pose.origin[1];
+    msg.pose.position.z = pose.origin[2];
+    msg.pose.orientation = rotationToQuaternionMsg(pose.rotation);
+    tray_target_pose_pub_->publish(msg);
     return true;
   }
 
@@ -6208,7 +6140,7 @@ private:
   {
     seek_first_valid_capture_.reset();
     seek_last_valid_capture_.reset();
-    seek_valid_motion_samples_.clear();
+    seek_valid_pose_samples_.clear();
     seek_valid_frame_count_ = 0;
     seek_window_started_ = false;
     seek_window_start_stamp_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
@@ -6218,7 +6150,7 @@ private:
   {
     seek_first_valid_capture_.reset();
     seek_last_valid_capture_.reset();
-    seek_valid_motion_samples_.clear();
+    seek_valid_pose_samples_.clear();
     seek_valid_frame_count_ = 0;
   }
 
@@ -6235,10 +6167,10 @@ private:
 
     seek_mode_active_ = true;
     seek_result_latched_ = false;
-    seek_vector_summary_.has_value = false;
+    seek_pose_summary_.has_value = false;
     resetSeekSessionState();
     profile_status_message_ = cv::format(
-      "Seek armed: %.1fs window, %.1fs decay, %d valid frames",
+      "Seek armed: %.1fs window, %.1fs decay, %d valid pose frames",
       seekWindowSeconds(),
       seekDecaySeconds(),
       seek_valid_confidence_frames_);
@@ -6253,32 +6185,29 @@ private:
       : "Debug images disabled";
   }
 
-  bool writeSeekPoseData(
-    const std::filesystem::path &pose_path,
-    const SeekCapture &first_capture,
-    const SeekCapture &last_capture,
-    const SeekMotionData &motion,
-    std::size_t motion_sample_count,
-    const std::filesystem::path &first_image_path,
-    const std::filesystem::path &last_image_path,
-    double effective_decay_sec) const
-  {
-    YAML::Emitter out;
-    out << YAML::BeginMap;
-    out << YAML::Key << "seek_window_sec" << YAML::Value << seekWindowSeconds();
-    out << YAML::Key << "seek_decay_sec" << YAML::Value << seekDecaySeconds();
-    out << YAML::Key << "effective_decay_sec" << YAML::Value << std::max(0.0, effective_decay_sec);
-    out << YAML::Key << "valid_frames_confidence" << YAML::Value << seek_valid_confidence_frames_;
-    out << YAML::Key << "motion_source" << YAML::Value << "average_all_valid_frames_linear_fit";
-    out << YAML::Key << "motion_sample_count" << YAML::Value << static_cast<int>(motion_sample_count);
-    out << YAML::Key << "first_frame_path" << YAML::Value << first_image_path.string();
-    out << YAML::Key << "last_frame_path" << YAML::Value << last_image_path.string();
-    out << YAML::Key << "units" << YAML::Value << YAML::BeginMap;
-    out << YAML::Key << "position" << YAML::Value << "mm";
-    out << YAML::Key << "delta_position" << YAML::Value << "mm";
-    out << YAML::Key << "velocity" << YAML::Value << "mm/s";
-    out << YAML::Key << "speed" << YAML::Value << "mm/s";
-    out << YAML::EndMap;
+	  bool writeSeekPoseData(
+	    const std::filesystem::path &pose_path,
+	    const SeekCapture &first_capture,
+	    const SeekCapture &last_capture,
+	    const SeekPoseAverageResult &average,
+	    const std::filesystem::path &first_image_path,
+	    const std::filesystem::path &last_image_path) const
+	  {
+	    YAML::Emitter out;
+	    out << YAML::BeginMap;
+	    out << YAML::Key << "seek_window_sec" << YAML::Value << seekWindowSeconds();
+	    out << YAML::Key << "seek_decay_sec" << YAML::Value << seekDecaySeconds();
+	    out << YAML::Key << "valid_frames_confidence" << YAML::Value << seek_valid_confidence_frames_;
+	    out << YAML::Key << "pose_source" << YAML::Value << "inlier_filtered_average";
+	    out << YAML::Key << "raw_pose_sample_count" << YAML::Value << static_cast<int>(average.raw_sample_count);
+	    out << YAML::Key << "inlier_pose_sample_count" << YAML::Value << static_cast<int>(average.inlier_sample_count);
+	    out << YAML::Key << "position_outlier_threshold_mm" << YAML::Value << pose_outlier_position_mm_;
+	    out << YAML::Key << "angle_outlier_threshold_deg" << YAML::Value << pose_outlier_angle_deg_;
+	    out << YAML::Key << "first_frame_path" << YAML::Value << first_image_path.string();
+	    out << YAML::Key << "last_frame_path" << YAML::Value << last_image_path.string();
+	    out << YAML::Key << "units" << YAML::Value << YAML::BeginMap;
+	    out << YAML::Key << "position" << YAML::Value << "mm";
+	    out << YAML::EndMap;
 
     const auto emit_capture = [&](const char *key, const SeekCapture &capture)
     {
@@ -6311,45 +6240,14 @@ private:
       out << YAML::EndMap;
     };
 
-    emit_capture("first_valid", first_capture);
-    emit_capture("last_valid", last_capture);
-
-    out << YAML::Key << "motion_camera_frame" << YAML::Value << YAML::BeginMap;
-    out << YAML::Key << "delta_t_sec" << YAML::Value << motion.dt_sec;
-    out << YAML::Key << "delta_position_mm" << YAML::Value << YAML::BeginMap;
-    out << YAML::Key << "x" << YAML::Value << motion.delta_position_mm[0];
-    out << YAML::Key << "y" << YAML::Value << motion.delta_position_mm[1];
-    out << YAML::Key << "z" << YAML::Value << motion.delta_position_mm[2];
-    out << YAML::EndMap;
-    out << YAML::Key << "velocity_mmps" << YAML::Value << YAML::BeginMap;
-    out << YAML::Key << "x" << YAML::Value << motion.velocity_camera_mmps[0];
-    out << YAML::Key << "y" << YAML::Value << motion.velocity_camera_mmps[1];
-    out << YAML::Key << "z" << YAML::Value << motion.velocity_camera_mmps[2];
-    out << YAML::EndMap;
-    out << YAML::Key << "speed_mmps" << YAML::Value << motion.speed_camera_mmps;
-    out << YAML::Key << "direction_unit" << YAML::Value << YAML::BeginMap;
-    out << YAML::Key << "x" << YAML::Value << motion.direction_camera[0];
-    out << YAML::Key << "y" << YAML::Value << motion.direction_camera[1];
-    out << YAML::Key << "z" << YAML::Value << motion.direction_camera[2];
-    out << YAML::EndMap;
-    out << YAML::EndMap;
-
-    out << YAML::Key << "motion_child_frame" << YAML::Value << YAML::BeginMap;
-    out << YAML::Key << "frame_id" << YAML::Value << tray_frame_id_;
-    out << YAML::Key << "delta_t_sec" << YAML::Value << motion.dt_sec;
-    out << YAML::Key << "velocity_mmps" << YAML::Value << YAML::BeginMap;
-    out << YAML::Key << "x" << YAML::Value << motion.velocity_child_mmps[0];
-    out << YAML::Key << "y" << YAML::Value << motion.velocity_child_mmps[1];
-    out << YAML::Key << "z" << YAML::Value << motion.velocity_child_mmps[2];
-    out << YAML::EndMap;
-    out << YAML::Key << "speed_mmps" << YAML::Value << motion.speed_child_mmps;
-    out << YAML::Key << "direction_unit" << YAML::Value << YAML::BeginMap;
-    out << YAML::Key << "x" << YAML::Value << motion.direction_child[0];
-    out << YAML::Key << "y" << YAML::Value << motion.direction_child[1];
-    out << YAML::Key << "z" << YAML::Value << motion.direction_child[2];
-    out << YAML::EndMap;
-    out << YAML::EndMap;
-    out << YAML::EndMap;
+	    emit_capture("first_valid", first_capture);
+	    emit_capture("last_valid", last_capture);
+	    SeekCapture averaged_capture;
+	    averaged_capture.stamp = last_capture.stamp;
+	    averaged_capture.frame_id = last_capture.frame_id;
+	    averaged_capture.pose = average.pose;
+	    emit_capture("averaged_pose", averaged_capture);
+	    out << YAML::EndMap;
 
     std::ofstream pose_file(pose_path);
     if (!pose_file.is_open())
@@ -6363,28 +6261,34 @@ private:
   void saveSeekScreenshotsAndPoseData(
     const rclcpp::Time &fallback_stamp,
     bool bypass_decay_on_publish = false)
-  {
-    seek_mode_active_ = false;
+	  {
+	    (void)bypass_decay_on_publish;
+	    seek_mode_active_ = false;
 
-    if (!seek_last_valid_capture_.has_value())
-    {
-      seek_vector_summary_.has_value = false;
-      seek_result_latched_ = false;
-      resetSeekSessionState();
-      profile_status_message_ = cv::format("Seek done (%.1fs): no valid tray frame", seekWindowSeconds());
+	    if (!seek_last_valid_capture_.has_value())
+	    {
+	      seek_pose_summary_.has_value = false;
+	      seek_result_latched_ = false;
+	      resetSeekSessionState();
+	      profile_status_message_ = cv::format("Seek done (%.1fs): no valid tray frame", seekWindowSeconds());
       return;
     }
 
     const auto &first_capture = seek_first_valid_capture_.has_value()
       ? *seek_first_valid_capture_
       : *seek_last_valid_capture_;
-    const auto &last_capture = *seek_last_valid_capture_;
-    const double effective_decay_sec = bypass_decay_on_publish ? 0.0 : seekDecaySeconds();
-    SeekMotionData motion = seek_valid_motion_samples_.size() >= 2
-      ? computeSeekMotionData(seek_valid_motion_samples_)
-      : computeSeekMotionData(first_capture, last_capture);
-    updateSeekVectorSummary(motion);
-    const bool published_seek_vector = publishSeekVectorData(last_capture, motion, effective_decay_sec);
+	    const auto &last_capture = *seek_last_valid_capture_;
+	    const auto averaged_pose = averageSeekPoseSamples();
+	    if (!averaged_pose.has_value())
+	    {
+	      seek_pose_summary_.has_value = false;
+	      seek_result_latched_ = false;
+	      profile_status_message_ = "Seek done: pose outlier rejection left too few inliers";
+	      resetSeekSessionState();
+	      return;
+	    }
+	    updateSeekPoseSummary(*averaged_pose);
+	    const bool published_seek_pose = publishSeekTargetPose(last_capture.stamp, last_capture.frame_id, averaged_pose->pose);
     const int64_t stamp_ns = (last_capture.stamp.nanoseconds() != 0)
       ? last_capture.stamp.nanoseconds()
       : fallback_stamp.nanoseconds();
@@ -6414,15 +6318,13 @@ private:
           !first_capture.frame.empty() && cv::imwrite(first_path.string(), first_capture.frame);
         const bool wrote_last =
           !last_capture.frame.empty() && cv::imwrite(last_path.string(), last_capture.frame);
-        const bool wrote_pose = writeSeekPoseData(
-          pose_path,
-          first_capture,
-          last_capture,
-          motion,
-          seek_valid_motion_samples_.size(),
-          first_path,
-          last_path,
-          effective_decay_sec);
+	        const bool wrote_pose = writeSeekPoseData(
+	          pose_path,
+	          first_capture,
+	          last_capture,
+	          *averaged_pose,
+	          first_path,
+	          last_path);
 
         if (wrote_first && wrote_last && wrote_pose)
         {
@@ -6447,11 +6349,11 @@ private:
       }
     }
 
-    if (!published_seek_vector)
-    {
-      profile_status_message_ = "Seek done: tray vector publisher unavailable";
-      seek_result_latched_ = false;
-    }
+	    if (!published_seek_pose)
+	    {
+	      profile_status_message_ = "Seek done: target pose publisher unavailable";
+	      seek_result_latched_ = false;
+	    }
     else
     {
       seek_result_latched_ = true;
@@ -6491,7 +6393,7 @@ private:
       capture.pose = *detected_pose;
       capture.frame_id = frame_id;
       capture.frame = output_frame.clone();
-      seek_valid_motion_samples_.push_back(SeekMotionSample{stamp, *detected_pose});
+	      seek_valid_pose_samples_.push_back(TimedTrayPose3D{stamp, *detected_pose, frame_id});
       if (!seek_first_valid_capture_.has_value())
       {
         seek_first_valid_capture_ = capture;
@@ -6519,7 +6421,7 @@ private:
 
     if (confidence_ready)
     {
-      // Confidence-only publish path: seek vector publish is always immediate (decay=0).
+	      // Confidence-only publish path: seek target pose publish is immediate.
       saveSeekScreenshotsAndPoseData(stamp, true);
       return;
     }
@@ -6528,7 +6430,7 @@ private:
     {
       seek_mode_active_ = false;
       seek_result_latched_ = false;
-      seek_vector_summary_.has_value = false;
+	      seek_pose_summary_.has_value = false;
       profile_status_message_ = cv::format(
         "Seek done (%.1fs): confidence not reached (%d/%d)",
         seekWindowSeconds(),
@@ -7199,24 +7101,21 @@ private:
         cv::LINE_AA);
     };
 
-    draw_panel(seek_vector_panel_rect_, "Motion Summary");
+    draw_panel(seek_pose_panel_rect_, "Pose Summary");
     draw_panel(seek_controls_panel_rect_, "Seek Controls");
     draw_panel(quality_panel_rect_, "Detection Quality");
 
-    if (seek_vector_summary_.has_value)
+    if (seek_pose_summary_.has_value)
     {
-      const cv::Vec3d delta_mm = seek_vector_summary_.delta_m * kMetersToMillimeters;
-      const double speed_mmps = seek_vector_summary_.delta_t_sec > 1e-6
-        ? (cv::norm(delta_mm) / seek_vector_summary_.delta_t_sec)
-        : 0.0;
+      const cv::Vec3d position_mm = seek_pose_summary_.averaged_position_m * kMetersToMillimeters;
       cv::putText(
         bar,
         cv::format(
-          "dX %+0.1f  dY %+0.1f  dZ %+0.1f mm",
-          delta_mm[0],
-          delta_mm[1],
-          delta_mm[2]),
-        seek_vector_label_origin_,
+          "X %+0.1f  Y %+0.1f  Z %+0.1f mm",
+          position_mm[0],
+          position_mm[1],
+          position_mm[2]),
+        seek_pose_label_origin_,
         cv::FONT_HERSHEY_DUPLEX,
         0.45,
         cv::Scalar(170, 238, 185),
@@ -7224,8 +7123,11 @@ private:
         cv::LINE_AA);
       cv::putText(
         bar,
-        cv::format("dt %.3fs   speed %.1f mm/s", seek_vector_summary_.delta_t_sec, speed_mmps),
-        seek_vector_value_origin_,
+        cv::format(
+          "samples %zu/%zu inliers",
+          seek_pose_summary_.inlier_sample_count,
+          seek_pose_summary_.raw_sample_count),
+        seek_pose_value_origin_,
         cv::FONT_HERSHEY_DUPLEX,
         0.45,
         cv::Scalar(205, 212, 220),
@@ -7233,8 +7135,8 @@ private:
         cv::LINE_AA);
       cv::putText(
         bar,
-        "Source: averaged all valid seek frames",
-        seek_vector_time_origin_,
+        "Source: outlier-filtered pose average",
+        seek_pose_time_origin_,
         cv::FONT_HERSHEY_DUPLEX,
         0.40,
         cv::Scalar(165, 170, 176),
@@ -7246,7 +7148,7 @@ private:
       cv::putText(
         bar,
         "No seek result yet",
-        seek_vector_label_origin_,
+        seek_pose_label_origin_,
         cv::FONT_HERSHEY_DUPLEX,
         0.50,
         cv::Scalar(170, 174, 180),
@@ -7254,8 +7156,8 @@ private:
         cv::LINE_AA);
       cv::putText(
         bar,
-        "Run Seek to capture valid tray motion",
-        seek_vector_value_origin_,
+        "Run Seek to publish an averaged tray pose",
+        seek_pose_value_origin_,
         cv::FONT_HERSHEY_DUPLEX,
         0.42,
         cv::Scalar(150, 154, 160),
@@ -7516,7 +7418,7 @@ private:
   std::string camera_info_topic_;
   std::string overlay_topic_;
   std::string tray_pose_topic_;
-  std::string tray_vector_topic_;
+  std::string tray_target_pose_topic_;
   std::string tray_cube_marker_topic_;
   std::string tray_dimensions_service_name_;
   std::string seek_service_name_;
@@ -7586,7 +7488,6 @@ private:
   double tray_width_mm_ {0.0};
   double tray_height_mm_ {0.0};
   double tray_thickness_mm_ {15.0};
-  double motion_update_period_sec_ {0.1};
   double pose_filter_window_sec_ {0.8};
   double pose_outlier_position_mm_ {20.0};
   double pose_outlier_angle_deg_ {12.0};
@@ -7612,7 +7513,7 @@ private:
   cv::Rect delete_confirm_dialog_rect_;
   cv::Rect delete_confirm_cancel_button_rect_;
   cv::Rect delete_confirm_accept_button_rect_;
-  cv::Rect seek_vector_panel_rect_;
+	  cv::Rect seek_pose_panel_rect_;
   cv::Rect seek_controls_panel_rect_;
   cv::Rect quality_panel_rect_;
   cv::Rect status_panel_rect_;
@@ -7620,9 +7521,9 @@ private:
   cv::Point seek_window_label_origin_;
   cv::Point seek_decay_label_origin_;
   cv::Point seek_confidence_label_origin_;
-  cv::Point seek_vector_label_origin_;
-  cv::Point seek_vector_value_origin_;
-  cv::Point seek_vector_time_origin_;
+	  cv::Point seek_pose_label_origin_;
+	  cv::Point seek_pose_value_origin_;
+	  cv::Point seek_pose_time_origin_;
   std::vector<cv::Rect> profile_option_rects_;
   std::vector<TrayProfile> tray_profiles_;
   std::vector<cv::Point2f> roi_points_;
@@ -7633,8 +7534,8 @@ private:
   std::string pose_history_frame_id_;
   std::optional<SeekCapture> seek_first_valid_capture_;
     std::optional<SeekCapture> seek_last_valid_capture_;
-    std::deque<SeekMotionSample> seek_valid_motion_samples_;
-    SeekVectorSummary seek_vector_summary_;
+	    std::deque<TimedTrayPose3D> seek_valid_pose_samples_;
+	    SeekPoseSummary seek_pose_summary_;
     std::string seek_snapshots_dir_;
     bool camera_exposure_dirty_ {true};
     rclcpp::Time last_camera_exposure_attempt_time_ {0, 0, RCL_ROS_TIME};
@@ -7644,7 +7545,7 @@ private:
     rclcpp::Publisher<ImageMsg>::SharedPtr overlay_pub_;
   rclcpp::Publisher<PoseStampedMsg>::SharedPtr tray_pose_pub_;
   rclcpp::Publisher<PolygonStampedMsg>::SharedPtr tray_axis_overlay_pub_;
-  rclcpp::Publisher<TrayVectorMsg>::SharedPtr tray_vector_pub_;
+	  rclcpp::Publisher<PoseStampedMsg>::SharedPtr tray_target_pose_pub_;
   rclcpp::Publisher<MarkerMsg>::SharedPtr tray_cube_marker_pub_;
   rclcpp::Service<GetTrayDimensionsSrv>::SharedPtr tray_dimensions_service_;
   rclcpp::Service<TriggerSrv>::SharedPtr seek_service_;

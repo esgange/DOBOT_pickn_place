@@ -7,8 +7,10 @@ from orbbec_camera_launcher import camera_watchdog
 
 class FakeProcess:
     next_pid = 43000
+    popen_calls = []
 
-    def __init__(self, *_args, **_kwargs):
+    def __init__(self, *args, **kwargs):
+        FakeProcess.popen_calls.append((args, kwargs))
         self.pid = FakeProcess.next_pid
         FakeProcess.next_pid += 1
         self.returncode = None
@@ -21,6 +23,7 @@ class FakeProcess:
 
 
 def test_watchdog_restarts_stale_and_exited_camera(monkeypatch):
+    FakeProcess.popen_calls = []
     monkeypatch.setattr(camera_watchdog.subprocess, 'Popen', FakeProcess)
     rclpy.init(args=[
         '--ros-args',
@@ -37,6 +40,9 @@ def test_watchdog_restarts_stale_and_exited_camera(monkeypatch):
         node = camera_watchdog.CameraWatchdog()
         state = node._states['test_camera']
         first_pid = state.process.pid
+        if hasattr(camera_watchdog.os, 'setsid'):
+            assert FakeProcess.popen_calls[-1][1].get('start_new_session') is True
+            assert callable(FakeProcess.popen_calls[-1][1].get('preexec_fn'))
 
         node._record_image('test_camera', 'color')
         node._record_image('test_camera', 'depth')

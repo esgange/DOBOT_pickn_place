@@ -10,7 +10,7 @@ from launch_ros.actions import Node
 STRING_PARAMS = (
     'runtime_settings_file',
     'motion_service_root',
-    'tray_vector_topic',
+    'tray_target_pose_topic',
     'tray_axis_overlay_topic',
     'start_sequence_service',
     'track_service',
@@ -39,7 +39,6 @@ FLOAT_PARAMS = (
     'post_follow_z_up_mm',
     'command_hysteresis_sec',
     'goal_tf_lookup_timeout_sec',
-    'tray_prediction_max_lead_sec',
     'preview_tray_length_mm',
     'preview_tray_width_mm',
 )

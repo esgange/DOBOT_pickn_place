@@ -58,12 +58,12 @@ flowchart LR
     Bringup -->|"DIStatus"| ItemPick
     Bringup -->|"RobotStatus"| Orchestrator
 
-    ItemDetect -->|"bin_seek_pose + selected_profile"| ItemPick
+    ItemDetect -->|"item_seek_pose + selected_profile"| ItemPick
     ItemDetect -->|"bin_overlay"| Orchestrator
     ItemPick -. "motion, pose, mode, tool, and DO services" .-> Bringup
     ItemPick -. "seek_complete / repick" .-> ItemDetect
 
-    TrayDetect -->|"tray_vector + tray_axis_overlay"| TrayIntercept
+    TrayDetect -->|"tray_target_pose + tray_axis_overlay"| TrayIntercept
     TrayDetect -->|"tray_overlay"| Orchestrator
     TrayIntercept -. "motion, pose, speed, and DO services" .-> Bringup
     TrayIntercept -. "seek_complete" .-> TrayDetect
@@ -107,7 +107,7 @@ Published state:
 | Topic | Main consumers |
 | --- | --- |
 | `/joint_states_robot` | `robot_state_publisher`, `motion_debug`, YOLO teach |
-| `dobot_msgs_v4/msg/RobotStatus` | `robot_cell_orchestrator`, `motion_debug` |
+| `dobot_msgs_v4/msg/RobotStatus` | `robot_cell_orchestrator`, `motion_debug`, `item_pick` |
 | `dobot_msgs_v4/msg/ToolVectorActual` | calibration, bin teach, movement calibration, motion debug |
 | `/dobot_bringup_ros2/msg/FeedInfo` | diagnostics |
 | `/dobot_bringup_ros2/DIStatus_200mS` | `item_pick`, `gripper_control` |
@@ -306,7 +306,7 @@ flowchart TD
     Prompt["SAM2 point/box prompts"]
     Samples["Generate YOLO segmentation samples"]
     Train["Train YOLO segmentation model"]
-    Export["Save best.onnx and item YAML"]
+    Export["Save best.pt and item YAML"]
 
     Camera --> Prompt
     BinProfile -.-> Prompt
@@ -361,7 +361,7 @@ Interfaces:
 | Direction | Default interface |
 | --- | --- |
 | Subscribe | bin-camera color, depth, and camera info |
-| Publish | `bin_overlay`, `bin_seek_pose`, `bin_item_poses`, `bin_cube_marker` |
+| Publish | `bin_overlay`, `item_seek_pose`, `bin_item_poses`, `bin_cube_marker` |
 | Publish, latched | `item_detect/selected_profile` |
 | Provide services | `item_detect/seek`, `repick`, `seek_complete`, `seek_status`, `go_to_teach` |
 | Call services | `/dobot_bringup_ros2/srv/MovJ`, camera exposure services |
@@ -374,7 +374,7 @@ stateDiagram-v2
     LoadProfile --> Idle: profile and calibration valid
     Idle --> Acquiring: tray_detect/seek
     Acquiring --> Acquiring: confidence below threshold
-    Acquiring --> Latched: stable tray pose/vector published
+    Acquiring --> Latched: averaged target pose published
     Latched --> Idle: tray_detect/seek_complete
     Acquiring --> Idle: seek toggled off
 
@@ -382,8 +382,8 @@ stateDiagram-v2
         [*] --> ReadRGBD
         ReadRGBD --> DetectEdges
         DetectEdges --> ProjectToSavedPlane
-        ProjectToSavedPlane --> FilterPoseAndVelocity
-        FilterPoseAndVelocity --> ConfidenceGate
+        ProjectToSavedPlane --> FilterAndAveragePose
+        FilterAndAveragePose --> ConfidenceGate
         ConfidenceGate --> ReadRGBD
     }
 ```
@@ -393,7 +393,7 @@ Interfaces:
 | Direction | Default interface |
 | --- | --- |
 | Subscribe | robot-camera color, depth, and camera info |
-| Publish | `tray_overlay`, `tray_pose`, `tray_axis_overlay`, `tray_vector`, `tray_cube_marker` |
+| Publish | `tray_overlay`, `tray_pose`, `tray_axis_overlay`, `tray_target_pose`, `tray_cube_marker` |
 | Provide services | `tray_detect/get_tray_dimensions`, `seek`, `seek_complete`, `seek_status`, `go_to_teach` |
 | Call services | `/dobot_bringup_ros2/srv/MovJ`, camera exposure services |
 
@@ -402,7 +402,7 @@ Interfaces:
 ```mermaid
 flowchart TD
     Arm["GUI, orchestrator, or start_sequence arms item_pick"]
-    Wait["Wait for fresh bin_seek_pose"]
+    Wait["Wait for fresh item_seek_pose"]
     Save["Save current joints for possible repick"]
     Goals["Apply item profile, tool offset,<br/>approach, and final Z-up"]
     Preview{"TF-only mode?"}
@@ -410,7 +410,7 @@ flowchart TD
     IOOpen["DO: open gripper, suction/exhaust off"]
     Descend["MovLIO descend<br/>turn suction on during descent"]
     Retract["MovL retract to approach"]
-    Idle["Wait for RobotMode idle and stable"]
+    Idle["Wait for fresh RobotStatus idle and stable"]
     DI{"Fresh DI1 suction active?"}
     Grip["DO: close gripper"]
     Up["MovL final Z-up"]
@@ -418,7 +418,9 @@ flowchart TD
     Auto{"Auto Repick enabled?"}
     Purge["Release/purge, MovJ to saved joints"]
     Repick["Re-arm and call item_detect/repick"]
-    Standby["Return to standby; Seek remains ON"]
+    FailPurge["Purge suction"]
+    FailComplete["Call item_detect/seek_complete"]
+    Standby["Return to standby"]
 
     Arm --> Wait --> Save --> Goals --> Preview
     Preview -->|Yes| Standby
@@ -426,41 +428,41 @@ flowchart TD
     DI -->|Yes| Grip --> Up --> Complete
     DI -->|No| Auto
     Auto -->|Yes| Purge --> Repick --> Wait
-    Auto -->|No| Standby
+    Auto -->|No| FailPurge --> FailComplete --> Standby
 ```
 
-`item_pick` subscribes to `bin_seek_pose`,
+`item_pick` subscribes to `item_seek_pose`,
 `item_detect/selected_profile`, and
 `/dobot_bringup_ros2/DIStatus_200mS`. It provides `item_pick/track`,
 `item_pick/track_status`, `item_pick/start_sequence`, and
 `item_pick/set_auto_repick`. Its DOBOT clients are `MovJ`, `MovL`, `MovLIO`,
-`GetAngle`, `GetPose`, `RobotMode`, `SetTool`, `Tool`, `Stop`, and `DO`.
+`GetAngle`, `GetPose`, `SetTool`, `Tool`, `Stop`, and `DO`.
 
 ## 8. Tray Intercept Logic
 
 ```mermaid
 flowchart TD
     Arm["GUI, orchestrator, or start_sequence arms tray_intercept"]
-    Wait["Wait for fresh tray_vector"]
+    Wait["Wait for fresh tray_target_pose"]
     Stop["Call Stop"]
-    Predict["Predict intercept from tray pose,<br/>velocity, offsets, and lead time"]
+    Goal["Transform stationary tray pose<br/>and apply tray-local offsets"]
     Preview{"TF-only mode?"}
-    Intercept["Queue MovL to intercept pose"]
+    Intercept["Queue MovL to target pose"]
     Follow{"Release IO enabled?"}
-    MovL["Queue MovL along tray direction"]
-    MovLIO["Queue MovLIO follow + release outputs"]
-    ZUp["Queue post-follow Z-up<br/>while continuing tray direction"]
+    Hold["Hold target pose"]
+    Release["Open release outputs at target pose"]
+    ZUp["Queue post-target Z-up"]
     Complete["Call tray_detect/seek_complete"]
     PreviewDone["Publish goal TFs only<br/>Seek remains latched"]
 
-    Arm --> Wait --> Stop --> Predict --> Preview
+    Arm --> Wait --> Stop --> Goal --> Preview
     Preview -->|Yes| PreviewDone
     Preview -->|No| Intercept --> Follow
-    Follow -->|No| MovL --> ZUp --> Complete
-    Follow -->|Yes| MovLIO --> ZUp --> Complete
+    Follow -->|No| Hold --> ZUp --> Complete
+    Follow -->|Yes| Release --> ZUp --> Complete
 ```
 
-`tray_intercept` subscribes to `tray_vector` and `tray_axis_overlay`, calls
+`tray_intercept` subscribes to `tray_target_pose` and `tray_axis_overlay`, calls
 `tray_detect/get_tray_dimensions`, and provides `tray_intercept/track`,
 `tray_intercept/track_status`, and `tray_intercept/start_sequence`. Its DOBOT
 clients are `MovL`, `MovLIO`, `Stop`, `CP`, `DO`, `GetPose`, and

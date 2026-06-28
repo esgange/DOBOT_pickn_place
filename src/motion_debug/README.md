@@ -37,7 +37,7 @@ ros2 run motion_debug motion_debug_gui
 | --- | --- |
 | `/joint_states_robot` | `sensor_msgs/msg/JointState` |
 | `dobot_msgs_v4/msg/ToolVectorActual` | `dobot_msgs_v4/msg/ToolVectorActual` |
-| `dobot_msgs_v4/msg/RobotStatus` | `dobot_msgs_v4/msg/RobotStatus` |
+| `dobot_msgs_v4/msg/RobotStatus` | `dobot_msgs_v4/msg/RobotStatus`; source of connection state and `robot_mode` |
 
 ## Robot Services
 
@@ -47,13 +47,12 @@ The GUI calls services under:
 /dobot_bringup_ros2/srv
 ```
 
-Common services used:
+Services used:
 
 - `EnableRobot`
 - `DisableRobot`
 - `ClearError`
 - `Stop`
-- `MoveJog`
 - `StopMoveJog`
 - `StartDrag`
 - `StopDrag`
@@ -68,6 +67,10 @@ Common services used:
 - `AccL`
 - `MovJ`
 - `MovL`
+
+Current controller mode comes from the `RobotStatus.robot_mode` topic field.
+The GUI does not poll `/dobot_bringup_ros2/srv/RobotMode`; it calls
+`GetErrorID` only when `RobotStatus.robot_mode == 9`.
 
 ## Motion Scripts
 

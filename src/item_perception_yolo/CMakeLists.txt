@@ -8,6 +8,8 @@ endif()
 find_package(ament_cmake REQUIRED)
 
 install(PROGRAMS
+  scripts/bin_teach_yolo_node.py
+  scripts/item_detect_yolo_debug_node.py
   scripts/item_detect_yolo_node.py
   scripts/item_teach_yolo_node.py
   DESTINATION lib/${PROJECT_NAME})

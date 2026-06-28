@@ -185,6 +185,7 @@ def ros_sourced_shell_command(cmd: list[str], *, source_python_venv: bool = True
         'set -e; '
         f'ROOT="${{DOBOT_PICKN_PLACE_ROOT:-{root}}}"; '
         'cd "$ROOT"; '
+        'export DOBOT_PICKN_PLACE_ROOT="$ROOT"; '
         'if [ -f /opt/ros/humble/setup.bash ]; then source /opt/ros/humble/setup.bash; fi; '
         'if [ -f "$ROOT/install/setup.bash" ]; then source "$ROOT/install/setup.bash"; fi; '
         f'{venv_source}'
@@ -369,6 +370,26 @@ def normalize_ipv4_address(value: str) -> str | None:
     if address.version != 4:
         return None
     return str(address)
+
+
+def sanitize_filename_token(value: str) -> str:
+    token: list[str] = []
+    previous_underscore = False
+    for ch in str(value or '').strip():
+        if ch.isalnum() or ch in '._-':
+            token.append(ch)
+            previous_underscore = False
+        elif not previous_underscore:
+            token.append('_')
+            previous_underscore = True
+    return ''.join(token).strip('_')
+
+
+def calibration_path_matches_robot_ip(path: Path, robot_ip_address: str) -> bool:
+    ip_token = sanitize_filename_token(robot_ip_address)
+    if not ip_token:
+        return False
+    return path.stem.endswith(f'_{ip_token}')
 
 
 def _load_yaml_mapping(path: Path) -> dict | None:
@@ -1345,6 +1366,7 @@ class RobotCellOrchestratorGui:
         self.platform_calibration_var = tk.StringVar(
             value=self._runtime_settings.platform_calibration_file
         )
+        self._sync_calibration_selection_to_robot_ip(persist=False, log_changes=False)
         self._last_calibration_scan = self._scan_calibrations()
         self._last_runtime_scan = self._scan_runtime()
         self._last_offline_scan: OfflineTeachScan | None = None
@@ -1482,27 +1504,27 @@ class RobotCellOrchestratorGui:
 
     @property
     def item_teach_dir(self) -> Path:
-        return workspace_path('teach', 'item_teach')
+        return workspace_path('teach', 'item_teach_yolo')
 
     @property
     def tray_teach_dir(self) -> Path:
-        return workspace_path('teach', 'tray_teach')
+        return workspace_path('teach', 'tray_teach_yolo')
 
     @property
     def item_detect_runtime_settings_file(self) -> Path:
-        return workspace_path('config', 'item_perception', 'item_detect_runtime_settings.yaml')
+        return workspace_path('config', 'item_perception_yolo', 'item_detect_yolo_runtime_settings.yaml')
 
     @property
     def tray_detect_runtime_settings_file(self) -> Path:
-        return workspace_path('config', 'tray_perception', 'tray_detect_runtime_settings.yaml')
+        return workspace_path('config', 'tray_perception_yolo', 'tray_detect_yolo_runtime_settings.yaml')
 
     @property
     def item_selected_profile_export_file(self) -> Path:
-        return workspace_path('config', 'item_perception', 'item_detect_selected_profile.txt')
+        return workspace_path('config', 'item_perception_yolo', 'item_detect_yolo_selected_profile.txt')
 
     @property
     def item_pick_runtime_settings_file(self) -> Path:
-        return workspace_path('config', 'item_perception', 'item_pick_runtime_settings.json')
+        return workspace_path('config', 'item_pick', 'item_pick_runtime_settings.json')
 
     @property
     def tray_intercept_runtime_settings_file(self) -> Path:
@@ -1525,6 +1547,7 @@ class RobotCellOrchestratorGui:
     def _reload_robot_ip_clicked(self) -> None:
         self.robot_ip_var.set(self._station_robot_ip_or_default())
         self._log(f'Reloaded robot IP from station_config: {self.robot_ip_var.get().strip()}')
+        self._sync_calibration_selection_to_robot_ip(persist=True, log_changes=True)
 
     def _save_robot_ip_clicked(self) -> None:
         if self._running:
@@ -1560,12 +1583,48 @@ class RobotCellOrchestratorGui:
 
         self.robot_ip_var.set(normalized_ip)
         self._log(f'Saved robot IP: {previous_ip or "unset"} -> {normalized_ip}')
+        self._sync_calibration_selection_to_robot_ip(persist=True, log_changes=True)
         if self._launch_processes.get('robot_bringup') is not None:
             messagebox.showinfo(
                 'Restart Robot Bringup',
                 'Robot IP saved. Stop and relaunch Robot Bringup to connect to the new controller IP.',
                 parent=self.root,
             )
+
+    def _sync_calibration_selection_to_robot_ip(self, *, persist: bool, log_changes: bool) -> None:
+        robot_ip = self._station_robot_ip_or_default()
+        updates: list[str] = []
+        missing: list[str] = []
+        was_suspended = getattr(self, '_suspend_runtime_settings_events', False)
+        self._suspend_runtime_settings_events = True
+        try:
+            for kind in CALIBRATION_PATTERNS:
+                latest = self._latest_calibration_path_for_robot(kind)
+                variable = self._calibration_variable(kind)
+                next_value = str(latest) if latest is not None else ''
+                previous_value = variable.get().strip()
+                if previous_value != next_value:
+                    variable.set(next_value)
+                    updates.append(f'{kind}={latest.name}' if latest is not None else f'{kind}=missing')
+                if latest is None:
+                    missing.append(kind)
+        finally:
+            self._suspend_runtime_settings_events = was_suspended
+
+        self._last_calibration_scan = self._scan_calibrations()
+        if getattr(self, '_calibration_buttons', {}):
+            self._refresh_calibration_button_texts()
+        if hasattr(self, 'calibration_status_var'):
+            if hasattr(self, '_last_runtime_scan'):
+                self._refresh_status_views()
+            else:
+                self.calibration_status_var.set(self._last_calibration_scan.message)
+        if log_changes and updates:
+            self._log(f'Robot {robot_ip} calibration selection: {", ".join(updates)}')
+        if log_changes and missing:
+            self._log(f'Robot {robot_ip} missing calibration file(s): {", ".join(missing)}')
+        if persist:
+            self._flush_robot_cell_orchestrator_runtime_settings()
 
     def _refresh_robot_ip_controls(self) -> None:
         setting_state = tk.DISABLED if self._running else tk.NORMAL
@@ -1777,36 +1836,54 @@ class RobotCellOrchestratorGui:
 
         def offline_bin(mode: str, headless: bool) -> list[str]:
             args = [
-                f'bin_teach_dir:={self.bin_teach_dir}',
                 f'output_dir:={self.bin_teach_dir}',
-                'auto_discover_platform_calibration:=false',
+            ]
+            args.extend(selected_calibration_arg(CALIBRATION_EYE_TO_HAND))
+            args.extend(selected_calibration_arg(CALIBRATION_PLATFORM, 'platform_calibration_file'))
+            if headless:
+                args.append('headless:=true')
+            return args
+
+        def offline_item_teach(mode: str, headless: bool) -> list[str]:
+            args = [
+                f'profile_dir:={self.item_teach_dir}',
+                f'model_root:={self.item_teach_dir}',
+                f'bin_teach_dir:={self.bin_teach_dir}',
             ]
             args.extend(selected_calibration_arg(CALIBRATION_EYE_TO_HAND))
             args.extend(selected_calibration_arg(CALIBRATION_PLATFORM, 'platform_calibration_file'))
             return args
 
-        def offline_item_teach(mode: str, headless: bool) -> list[str]:
+        def offline_tray_teach(mode: str, headless: bool) -> list[str]:
             args = [
-                f'profiles_dir:={self.item_teach_dir}',
+                f'profile_dir:={self.tray_teach_dir}',
+                f'model_root:={self.tray_teach_dir}',
                 f'bin_teach_dir:={self.bin_teach_dir}',
-                'auto_discover_calibration:=false',
             ]
-            args.extend(selected_calibration_arg(CALIBRATION_EYE_TO_HAND))
+            args.extend(selected_calibration_arg(CALIBRATION_EYE_ON_HAND))
             return args
-
-        offline_tray_teach = lambda mode, headless: [f'profiles_dir:={self.tray_teach_dir}']
 
         def item_detect(mode: str, headless: bool) -> list[str]:
             profiles_dir = self.runtime_dir if mode == MODE_ONLINE else self.item_teach_dir
-            args = [f'profiles_dir:={profiles_dir}']
-            args.extend(self._selected_detect_profile_launch_args(TEACH_KIND_ITEM, mode))
+            args = [
+                f'profiles_dir:={profiles_dir}',
+                f'model_root:={profiles_dir}',
+                f'runtime_settings_file:={self.item_detect_runtime_settings_file}',
+                f'selected_profile_export_file:={self.item_selected_profile_export_file}',
+            ]
             args.extend(selected_calibration_arg(CALIBRATION_EYE_TO_HAND))
+            args.extend(selected_calibration_arg(CALIBRATION_PLATFORM, 'platform_calibration_file'))
             if headless:
                 args.append('headless:=true')
             return args
 
         def tray_detect(mode: str, headless: bool) -> list[str]:
-            args = [f'profiles_dir:={self.runtime_dir if mode == MODE_ONLINE else self.tray_teach_dir}']
+            profiles_dir = self.runtime_dir if mode == MODE_ONLINE else self.tray_teach_dir
+            args = [
+                f'profiles_dir:={profiles_dir}',
+                f'model_root:={profiles_dir}',
+                f'runtime_settings_file:={self.tray_detect_runtime_settings_file}',
+            ]
             args.extend(self._selected_detect_profile_launch_args(TEACH_KIND_TRAY, mode))
             args.extend(selected_calibration_arg(CALIBRATION_EYE_ON_HAND))
             if headless:
@@ -1817,14 +1894,27 @@ class RobotCellOrchestratorGui:
             return selected_calibration_arg(CALIBRATION_EYE_TO_HAND)
 
         def item_pick(mode: str, headless: bool) -> list[str]:
+            args = [
+                'camera_safety_frame_id:=arm_calibrated_camera_link',
+            ]
+            args.extend(selected_calibration_arg(
+                CALIBRATION_EYE_TO_HAND,
+                'calibration_file',
+            ))
+            args.extend(selected_calibration_arg(
+                CALIBRATION_EYE_ON_HAND,
+                'camera_safety_calibration_file',
+            ))
+            args.extend(selected_calibration_arg(CALIBRATION_PLATFORM, 'platform_calibration_file'))
             if not headless:
-                return []
-            return [
+                return args
+            args.extend([
                 'headless:=true',
                 'load_runtime_settings:=true',
                 f'runtime_settings_file:={self.item_pick_runtime_settings_file}',
                 f'item_profile_state_file:={self.item_selected_profile_export_file}',
-            ]
+            ])
+            return args
 
         def tray_intercept(mode: str, headless: bool) -> list[str]:
             if not headless:
@@ -1869,26 +1959,32 @@ class RobotCellOrchestratorGui:
             ),
             'bin_teach': LaunchSpec(
                 'Bin Teach',
-                'item_perception',
-                'bin_teach.launch.py',
+                'item_perception_yolo',
+                'bin_teach_yolo.launch.py',
                 offline_bin,
                 (CALIBRATION_EYE_TO_HAND, CALIBRATION_PLATFORM),
             ),
-            'tray_teach': LaunchSpec('Tray Teach', 'tray_perception', 'tray_teach.launch.py', offline_tray_teach, None),
+            'tray_teach': LaunchSpec(
+                'Tray Teach',
+                'tray_perception_yolo',
+                'tray_teach_yolo.launch.py',
+                offline_tray_teach,
+                CALIBRATION_EYE_ON_HAND,
+            ),
             'item_teach': LaunchSpec(
                 'Item Teach',
-                'item_perception',
-                'item_teach.launch.py',
+                'item_perception_yolo',
+                'item_teach_yolo.launch.py',
                 offline_item_teach,
-                CALIBRATION_EYE_TO_HAND,
+                (CALIBRATION_EYE_TO_HAND, CALIBRATION_PLATFORM),
             ),
             'item_pick': LaunchSpec('Item Pick', 'item_pick', 'item_pick.launch.py', item_pick, headless_label='Item Pick Headless'),
             'item_detect': LaunchSpec(
                 'Item Detect',
-                'item_perception',
-                'item_detect.launch.py',
+                'item_perception_yolo',
+                'item_detect_yolo.launch.py',
                 item_detect,
-                CALIBRATION_EYE_TO_HAND,
+                (CALIBRATION_EYE_TO_HAND, CALIBRATION_PLATFORM),
                 headless_label='Item Detect Headless',
             ),
             'tray_intercept': LaunchSpec(
@@ -1900,8 +1996,8 @@ class RobotCellOrchestratorGui:
             ),
             'tray_detect': LaunchSpec(
                 'Tray Detect',
-                'tray_perception',
-                'tray_detect.launch.py',
+                'tray_perception_yolo',
+                'tray_detect_yolo.launch.py',
                 tray_detect,
                 CALIBRATION_EYE_ON_HAND,
                 headless_label='Tray Detect Headless',
@@ -2372,7 +2468,29 @@ class RobotCellOrchestratorGui:
             CALIBRATION_PLATFORM: self.platform_calibration_var,
         }[kind]
 
-    def _resolve_calibration_path(self, kind: str, raw_value: str) -> Path | None:
+    def _latest_calibration_path_for_robot(self, kind: str) -> Path | None:
+        robot_ip = self._station_robot_ip_or_default()
+        pattern = CALIBRATION_PATTERNS.get(kind, '*.yaml')
+        calibration_dir = workspace_path('calibration')
+        if not robot_ip or not calibration_dir.exists():
+            return None
+        candidates = [
+            path
+            for path in calibration_dir.glob(pattern)
+            if path.is_file()
+            and path.stat().st_size > 0
+            and classify_calibration_yaml(path) == kind
+            and calibration_path_matches_robot_ip(path, robot_ip)
+        ]
+        return max(candidates, key=lambda path: path.stat().st_mtime).resolve() if candidates else None
+
+    def _resolve_calibration_path(
+        self,
+        kind: str,
+        raw_value: str,
+        *,
+        require_current_robot_ip: bool = False,
+    ) -> Path | None:
         selected = str(raw_value or '').strip()
         if not selected:
             return None
@@ -2383,11 +2501,24 @@ class RobotCellOrchestratorGui:
             return None
         if classify_calibration_yaml(path) != kind:
             return None
-        return path.resolve()
+        resolved = path.resolve()
+        if require_current_robot_ip and not calibration_path_matches_robot_ip(
+            resolved,
+            self._station_robot_ip_or_default(),
+        ):
+            return None
+        return resolved
 
     def _selected_calibration_path(self, kind: str) -> Path | None:
         variable = self._calibration_variable(kind)
-        return self._resolve_calibration_path(kind, variable.get())
+        selected = self._resolve_calibration_path(
+            kind,
+            variable.get(),
+            require_current_robot_ip=True,
+        )
+        if selected is not None:
+            return selected
+        return self._latest_calibration_path_for_robot(kind)
 
     def _select_calibration_file(self, kind: str, variable: tk.StringVar) -> None:
         current = self._resolve_calibration_path(kind, variable.get())
@@ -2417,6 +2548,17 @@ class RobotCellOrchestratorGui:
                 parent=self.root,
             )
             return
+        if not calibration_path_matches_robot_ip(path, self._station_robot_ip_or_default()):
+            current_ip = self._station_robot_ip_or_default()
+            self._log(
+                f'Calibration file {path.name} does not match current robot IP {current_ip}.'
+            )
+            messagebox.showerror(
+                'Wrong Robot Calibration',
+                f'{path.name} is not tagged for current robot IP {current_ip}.',
+                parent=self.root,
+            )
+            return
 
         variable.set(str(path.resolve()))
         self._log(f'Selected {kind} calibration: {path.name}')
@@ -2426,6 +2568,8 @@ class RobotCellOrchestratorGui:
         self._log(f'Cleared {kind} calibration selection')
 
     def _calibration_selection_changed(self) -> None:
+        if self._suspend_runtime_settings_events:
+            return
         self._last_calibration_scan = self._scan_calibrations()
         self._refresh_calibration_button_texts()
         self._schedule_robot_cell_orchestrator_runtime_settings_save()

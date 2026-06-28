@@ -14,6 +14,7 @@ STRING_PARAMS = (
     'motion_service_root',
     'gripper_do_service',
     'di_status_topic',
+    'robot_status_topic',
     'item_pose_topic',
     'start_sequence_service',
     'track_service',
@@ -23,7 +24,11 @@ STRING_PARAMS = (
     'auto_repick_service',
     'robot_goal_frame_id',
     'robot_gripper_frame_id',
+    'calibration_file',
+    'platform_calibration_file',
     'camera_safety_frame_id',
+    'camera_safety_calibration_file',
+    'error_log_file',
 )
 
 BOOL_PARAMS = (
@@ -31,7 +36,7 @@ BOOL_PARAMS = (
     'load_runtime_settings',
     'tf_only_mode',
     'publish_goal_debug_tf',
-    'prefer_camera_inside_bin',
+    'publish_camera_safety_calibration_tf',
     'auto_repick_on_failed_suction',
 )
 

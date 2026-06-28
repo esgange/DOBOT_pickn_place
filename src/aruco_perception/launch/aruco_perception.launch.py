@@ -180,6 +180,10 @@ def generate_launch_description():
                             description="Show the detector's standalone OpenCV overlay window."),
       DeclareLaunchArgument("publish_overlay", default_value="true",
                             description="Publish the RGB/depth debug overlay image."),
+      DeclareLaunchArgument("overlay_topic", default_value="/aruco_overlay",
+                            description="RGB/depth debug overlay image topic."),
+      DeclareLaunchArgument("show_bin_roi_dots_overlay", default_value="false",
+                            description="Draw visual-only outside-marker ROI dots on the overlay."),
       DeclareLaunchArgument("publish_marker_tfs", default_value="true",
                             description="Publish individual aruco_marker_* TFs."),
       DeclareLaunchArgument("overlay_rate_hz", default_value="10.0",
@@ -209,6 +213,8 @@ def launch_setup(context, *args, **kwargs):
   )
   show_overlay_window = LaunchConfiguration("show_overlay_window")
   publish_overlay = LaunchConfiguration("publish_overlay")
+  overlay_topic = LaunchConfiguration("overlay_topic")
+  show_bin_roi_dots_overlay = LaunchConfiguration("show_bin_roi_dots_overlay")
   publish_marker_tfs = LaunchConfiguration("publish_marker_tfs")
   overlay_rate_hz = LaunchConfiguration("overlay_rate_hz")
   detections_topic = LaunchConfiguration("detections_topic")
@@ -286,6 +292,8 @@ def launch_setup(context, *args, **kwargs):
         "calibration_child_frame": child_frame,
         "show_overlay_window": ParameterValue(show_overlay_window, value_type=bool),
         "publish_overlay": ParameterValue(publish_overlay, value_type=bool),
+        "overlay_topic": overlay_topic,
+        "show_bin_roi_dots_overlay": ParameterValue(show_bin_roi_dots_overlay, value_type=bool),
         "publish_marker_tfs": ParameterValue(publish_marker_tfs, value_type=bool),
         "overlay_rate_hz": ParameterValue(overlay_rate_hz, value_type=float),
         "detections_topic": detections_topic,

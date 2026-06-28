@@ -30,7 +30,6 @@ from dobot_msgs_v4.srv import (
     GetErrorID,
     MovJ,
     MovL,
-    RobotMode,
     SetPayload,
     SetTool,
     SpeedFactor,
@@ -310,7 +309,6 @@ class MotionDebugNode(Node):
         self._startup_cp_attempted = False
         self._startup_tool_disable_attempted = False
         self._startup_tool_tcp_reset_attempted = False
-        self._robot_mode_future = None
         self._error_id_future = None
         self._raw_tcp_values = {field_name: 0.0 for field_name, _, _, _ in TCP_FIELDS}
         self._last_motion_point: ScriptMotionPoint | None = None
@@ -341,7 +339,6 @@ class MotionDebugNode(Node):
         self._start_drag_client = self.create_client(StartDrag, f'{SERVICE_ROOT}/StartDrag')
         self._stop_drag_client = self.create_client(StopDrag, f'{SERVICE_ROOT}/StopDrag')
         self._tool_client = self.create_client(Tool, f'{SERVICE_ROOT}/Tool')
-        self._robot_mode_client = self.create_client(RobotMode, f'{SERVICE_ROOT}/RobotMode')
         self._get_error_id_client = self.create_client(GetErrorID, f'{SERVICE_ROOT}/GetErrorID')
         self._set_payload_client = self.create_client(SetPayload, f'{SERVICE_ROOT}/SetPayload')
         self._set_tool_client = self.create_client(SetTool, f'{SERVICE_ROOT}/SetTool')
@@ -1462,14 +1459,23 @@ class MotionDebugNode(Node):
 
     def _status_callback(self, msg: RobotStatus) -> None:
         now = time.time()
+        mode_code = int(msg.robot_mode) if msg.is_connected else None
         with self._lock:
             self._snapshot.connected = msg.is_connected
             self._snapshot.enabled = msg.is_enable
+            self._snapshot.controller_mode_code = mode_code
+            self._snapshot.drag_enabled = mode_code == 6
+            self._snapshot.controller_text = self._format_controller_mode_code(mode_code)
             self._snapshot.status_stamp = now
-            if msg.is_connected and msg.is_enable:
-                self._snapshot.controller_mode_code = 5
-                self._snapshot.drag_enabled = False
-                self._snapshot.controller_text = 'Enabled'
+            if not msg.is_connected:
+                self._snapshot.controller_text = 'Waiting for dashboard connection...'
+                self._snapshot.error_text = 'No error info yet'
+                self._snapshot.error_active = False
+            elif mode_code == 9:
+                if not self._snapshot.error_active:
+                    self._snapshot.error_text = 'Controller reports error; waiting for error details'
+                self._snapshot.error_active = True
+            else:
                 self._snapshot.error_text = 'No active alarms'
                 self._snapshot.error_active = False
         self._dispatch_queued_service_if_ready()
@@ -1484,25 +1490,6 @@ class MotionDebugNode(Node):
                 self._snapshot.error_text = 'No error info yet'
                 self._snapshot.error_active = False
             return
-
-        if snapshot.enabled is True:
-            with self._lock:
-                self._snapshot.controller_mode_code = 5
-                self._snapshot.drag_enabled = False
-                self._snapshot.controller_text = 'Enabled'
-                self._snapshot.error_text = 'No active alarms'
-                self._snapshot.error_active = False
-            self._apply_startup_speed_factor_if_needed()
-            self._apply_startup_tool_disable_if_needed()
-            self._apply_startup_tool_tcp_reset_if_needed()
-            self._apply_startup_cp_if_needed()
-            return
-
-        if self._robot_mode_future is None or self._robot_mode_future.done():
-            if self._robot_mode_client.service_is_ready():
-                self._log_event('service', f'dispatch RobotMode -> {SERVICE_ROOT}/RobotMode {{}}')
-                self._robot_mode_future = self._robot_mode_client.call_async(RobotMode.Request())
-                self._robot_mode_future.add_done_callback(self._handle_robot_mode)
 
         if snapshot.controller_mode_code == 9:
             if self._error_id_future is None or self._error_id_future.done():
@@ -1519,28 +1506,6 @@ class MotionDebugNode(Node):
         self._apply_startup_tool_disable_if_needed()
         self._apply_startup_tool_tcp_reset_if_needed()
         self._apply_startup_cp_if_needed()
-
-    def _handle_robot_mode(self, future) -> None:
-        try:
-            response = future.result()
-            raw_mode_text = self._clean_text(response.robot_return)
-            mode_code = self._extract_mode_code(raw_mode_text)
-            mode_text = self._format_controller_text(raw_mode_text, response.res)
-        except Exception as exc:  # pragma: no cover - defensive UI path
-            mode_code = None
-            mode_text = f'RobotMode failed: {exc}'
-            self._log_event('service', f'RobotMode -> {SERVICE_ROOT}/RobotMode {{}}: {mode_text}')
-        else:
-            self._log_event(
-                'service',
-                f'RobotMode -> {SERVICE_ROOT}/RobotMode {{}}: ok | robot_return={raw_mode_text!r}, res={response.res}',
-            )
-
-        with self._lock:
-            self._snapshot.controller_mode_code = mode_code
-            self._snapshot.drag_enabled = mode_code == 6
-            self._snapshot.controller_text = mode_text
-        self._dispatch_queued_service_if_ready()
 
     def _handle_error_id(self, future) -> None:
         try:
@@ -1902,44 +1867,26 @@ class MotionDebugNode(Node):
     def _clean_text(self, value: str) -> str:
         return value.strip().strip('\t').strip()
 
-    def _extract_mode_code(self, raw_text: str) -> int | None:
-        value = raw_text.strip()
-        if value.startswith('{') and value.endswith('}') and ',' not in value:
-            value = value[1:-1].strip()
-        if value.isdigit():
-            return int(value)
-        return None
-
     def _robot_should_disable(self, snapshot: MotionSnapshot) -> bool:
         return snapshot.controller_mode_code in {5, 6, 7} or bool(snapshot.enabled)
 
-    def _format_controller_text(self, raw_text: str, res: int) -> str:
-        if not raw_text:
-            return f'Unknown (res={res})'
-
-        if 'control mode is not tcp' in raw_text.lower():
-            return raw_text
-
-        value = raw_text.strip()
-        if value.startswith('{') and value.endswith('}') and ',' not in value:
-            value = value[1:-1].strip()
-
+    def _format_controller_mode_code(self, mode_code: int | None) -> str:
+        if mode_code is None:
+            return 'Waiting for controller state...'
         mode_map = {
-            '1': 'Initializing',
-            '2': 'Brake Open',
-            '4': 'Disabled',
-            '5': 'Enabled',
-            '6': 'Drag Mode',
-            '7': 'Running',
-            '8': 'Recording',
-            '9': 'Error',
-            '10': 'Paused',
-            '11': 'Jogging',
+            1: 'Initializing',
+            2: 'Brake Open',
+            4: 'Disabled',
+            5: 'Enabled',
+            6: 'Drag Mode',
+            7: 'Running',
+            8: 'Recording',
+            9: 'Error',
+            10: 'Paused',
+            11: 'Jogging',
         }
-        if value in mode_map:
-            return f'{mode_map[value]} ({value})'
-
-        return raw_text
+        label = mode_map.get(mode_code, 'Unknown')
+        return f'{label} ({mode_code})'
 
     def _format_error_text(self, raw_text: str, res: int) -> str:
         if not raw_text:

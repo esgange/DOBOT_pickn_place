@@ -60,8 +60,6 @@ using ImageMsg = sensor_msgs::msg::Image;
 using TransformStampedMsg = geometry_msgs::msg::TransformStamped;
 
 constexpr size_t kRequiredMarkerCount = 4;
-constexpr int64_t kMinArucoId = 0;
-constexpr int64_t kMaxArucoId = 49;  // DICT_5X5_50
 
 std::chrono::steady_clock::time_point steadyNow()
 {
@@ -158,17 +156,18 @@ bool validateMarkerIds(const std::vector<int64_t> &marker_ids, std::string &reas
 {
   if (marker_ids.size() != kRequiredMarkerCount)
   {
-    reason = "marker_ids must contain exactly 4 ArUco IDs.";
+    reason = "platform_calibration marker_ids must be exactly [1, 2, 3, 4].";
     return false;
   }
-  for (const auto id : marker_ids)
+
+  const std::set<int64_t> required_ids{1, 2, 3, 4};
+  const std::set<int64_t> configured_ids(marker_ids.begin(), marker_ids.end());
+  if (configured_ids != required_ids)
   {
-    if (id < kMinArucoId || id > kMaxArucoId)
-    {
-      reason = "marker_ids must be in range 0..49 for DICT_5X5_50.";
-      return false;
-    }
+    reason = "platform_calibration requires marker IDs 1, 2, 3, and 4 with no duplicates.";
+    return false;
   }
+
   reason.clear();
   return true;
 }

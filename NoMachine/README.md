@@ -17,10 +17,10 @@ ROS 2 already installed, run the one-click bootstrap from the repository root:
 ./NoMachine/remote_ready_ubuntu22.sh
 ```
 
-That script uses the bundled NoMachine package in `NoMachine/debs/`, installs
-XFCE only if no desktop environment is present, opens TCP/4000 in UFW when UFW
-is active, and enables NoMachine virtual-display mode when no monitor is
-detected.
+That script prefers a cached NoMachine package in `NoMachine/debs/` when one is
+present, otherwise it downloads the package from NoMachine. It installs XFCE
+only if no desktop environment is present, opens TCP/4000 in UFW when UFW is
+active, and enables NoMachine virtual-display mode when no monitor is detected.
 
 The lower-level installer is also available:
 
@@ -83,21 +83,19 @@ Login with the normal Linux username and password for the remote node.
 
 ## Notes
 
-- The repo currently bundles the official NoMachine `amd64` DEB for Ryzen/x86_64
-  nodes: `NoMachine/debs/nomachine_9.6.3_1_amd64.deb`.
-- The installer prefers bundled DEBs from `NoMachine/debs/` and only downloads
-  from NoMachine when the needed architecture is not bundled and `--offline-only`
-  is not set.
-- Refresh or add cached architectures with:
+- The source repo keeps installer DEBs out of normal commits. The installer
+  prefers cached DEBs from `NoMachine/debs/` and downloads from NoMachine when
+  the needed architecture is not cached and `--offline-only` is not set.
+- Refresh or add cached architectures for an offline handoff bundle with:
 
   ```bash
   ./NoMachine/cache_nomachine_debs.sh amd64
   ./NoMachine/cache_nomachine_debs.sh amd64 arm64 armhf
   ```
 
-- It requires `sudo`. NoMachine itself is bundled for `amd64`; Ubuntu packages
-  such as `xfce4`, `xfce4-terminal`, `dbus-x11`, `ufw`, `curl`, or
-  `ca-certificates` are installed from the Ubuntu apt repositories when missing.
+- It requires `sudo`. Ubuntu packages such as `xfce4`, `xfce4-terminal`,
+  `dbus-x11`, `ufw`, `curl`, or `ca-certificates` are installed from the Ubuntu
+  apt repositories when missing.
 - NoMachine needs a desktop environment. Use `--install-xfce` if this machine
   only has a terminal/server install.
 - Keep port `4000/tcp` on the LAN only. Do not expose it directly to the

@@ -17,21 +17,21 @@ _dobot_find_file_upwards() {
 _dobot_station_config=""
 _dobot_ros_domain_config=""
 
-if [ -n "$DOBOT_PICKN_PLACE_ROOT" ]; then
+if [ -n "${DOBOT_PICKN_PLACE_ROOT:-}" ]; then
   _dobot_station_config="$DOBOT_PICKN_PLACE_ROOT/station_config"
   _dobot_ros_domain_config="$DOBOT_PICKN_PLACE_ROOT/config/robot_bringup/param.json"
-elif [ -n "$DOBOT_WORKSPACE_ROOT" ]; then
+elif [ -n "${DOBOT_WORKSPACE_ROOT:-}" ]; then
   _dobot_station_config="$DOBOT_WORKSPACE_ROOT/station_config"
   _dobot_ros_domain_config="$DOBOT_WORKSPACE_ROOT/config/robot_bringup/param.json"
-elif [ -n "$AMENT_CURRENT_PREFIX" ]; then
-  _dobot_station_config="$(_dobot_find_file_upwards "$AMENT_CURRENT_PREFIX" "station_config")"
-  _dobot_ros_domain_config="$(_dobot_find_file_upwards "$AMENT_CURRENT_PREFIX" "config/robot_bringup/param.json")"
-elif [ -n "$COLCON_CURRENT_PREFIX" ]; then
-  _dobot_station_config="$(_dobot_find_file_upwards "$COLCON_CURRENT_PREFIX" "station_config")"
-  _dobot_ros_domain_config="$(_dobot_find_file_upwards "$COLCON_CURRENT_PREFIX" "config/robot_bringup/param.json")"
+elif [ -n "${AMENT_CURRENT_PREFIX:-}" ]; then
+  _dobot_station_config="$(_dobot_find_file_upwards "$AMENT_CURRENT_PREFIX" "station_config" || true)"
+  _dobot_ros_domain_config="$(_dobot_find_file_upwards "$AMENT_CURRENT_PREFIX" "config/robot_bringup/param.json" || true)"
+elif [ -n "${COLCON_CURRENT_PREFIX:-}" ]; then
+  _dobot_station_config="$(_dobot_find_file_upwards "$COLCON_CURRENT_PREFIX" "station_config" || true)"
+  _dobot_ros_domain_config="$(_dobot_find_file_upwards "$COLCON_CURRENT_PREFIX" "config/robot_bringup/param.json" || true)"
 fi
 
-if [ -z "$_dobot_ros_domain_config" ] && [ -n "$COLCON_CURRENT_PREFIX" ]; then
+if [ -z "$_dobot_ros_domain_config" ] && [ -n "${COLCON_CURRENT_PREFIX:-}" ]; then
   _dobot_ros_domain_config="$COLCON_CURRENT_PREFIX/share/cr_robot_ros2/config/param.json"
 fi
 

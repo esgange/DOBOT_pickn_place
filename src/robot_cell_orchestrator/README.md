@@ -66,7 +66,7 @@ Launch the Robot Cell Orchestrator GUI:
 ros2 launch robot_cell_orchestrator robot_cell_orchestrator.launch.py
 ```
 
-Launch the runtime stack without Robot Cell Orchestrator GUI:
+Launch the Robot Cell Orchestrator managed headless runtime stack:
 
 ```bash
 ros2 launch robot_cell_orchestrator robot_runtime_headless.launch.py
@@ -74,7 +74,10 @@ ros2 launch robot_cell_orchestrator robot_runtime_headless.launch.py
 
 This starts the configured Orbbec cameras, `item_detect`, `item_pick` in
 headless service mode, `tray_detect`, and `tray_intercept` in headless service
-mode. The camera watchdog publishes `/camera_watchdog/status` and
+mode under the Robot Cell Orchestrator launch. The calibration files come from
+the Robot Cell Orchestrator UI runtime settings saved in
+`config/robot_cell_orchestrator/robot_cell_orchestrator_runtime_settings.yaml`.
+The camera watchdog publishes `/camera_watchdog/status` and
 `/camera_watchdog/healthy`, and automatically relaunches camera drivers whose
 color/depth streams stop. RViz is available as a launch argument and is off by
 default:
@@ -97,16 +100,23 @@ WORKSPACE_ROOT/config/robot_cell_orchestrator/robot_runtime_headless_settings.ya
 ```
 
 That file owns camera launch selection, RViz on/off, online/offline profile
-dirs, topics, service names, calibration paths, and child runtime settings file
-paths. Its `camera.watchdog` section controls startup/health timeouts and
-restart backoff. Launch arguments are overrides only, for example:
+dirs, topics, service names, and child runtime settings file paths. Calibration
+file choices are owned by the Robot Cell Orchestrator UI settings file:
+
+```text
+WORKSPACE_ROOT/config/robot_cell_orchestrator/robot_cell_orchestrator_runtime_settings.yaml
+```
+
+The headless launch passes those UI-selected Eye-on-hand and Eye-to-hand files
+to the child nodes. Its `camera.watchdog` section controls startup/health
+timeouts and restart backoff. Launch arguments are overrides only, for example:
 
 ```bash
 ros2 launch robot_cell_orchestrator robot_runtime_headless.launch.py launch_rviz:=true mode:=offline
 ```
 
 The motion settings for headless `item_pick` and `tray_intercept` are loaded
-from their JSON runtime files in `config/item_perception` and
+from their JSON runtime files in `config/item_pick` and
 `config/tray_perception`. In headless mode those JSON files must exist and
 contain all required keys; the nodes will not silently continue with launch
 defaults when runtime settings are incomplete.
@@ -156,6 +166,12 @@ right-side **Node Launcher** when you want them running:
 - `Tray Intercept`
 - `Tray Detect`
 
+The Node Launcher starts each support process in a sourced shell rooted at
+`WORKSPACE_ROOT` and exports `DOBOT_PICKN_PLACE_ROOT` for child launches. This
+keeps Robot Bringup, camera launcher, and perception nodes using the same
+station-local config paths whether they are started from the UI or from a direct
+terminal.
+
 When the Node Launcher headless toggle is ON, `Item Pick` and `Tray Intercept`
 use `headless:=true` and load their JSON runtime settings. `Item Detect` and
 `Tray Detect` use `headless:=true` and receive the active teach file through
@@ -170,8 +186,8 @@ nodes are launched manually.
 
 ```text
 WORKSPACE_ROOT/teach/bin_teach
-WORKSPACE_ROOT/teach/item_teach
-WORKSPACE_ROOT/teach/tray_teach
+WORKSPACE_ROOT/teach/item_teach_yolo
+WORKSPACE_ROOT/teach/tray_teach_yolo
 ```
 
 The offline dropdowns choose the bin, item, and tray teach files used for

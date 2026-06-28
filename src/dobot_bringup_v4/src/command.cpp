@@ -129,7 +129,18 @@ CRCommanderRos2::CRCommanderRos2(const std::string &ip)
 CRCommanderRos2::~CRCommanderRos2()
 {
     is_running_ = false;
-    thread_->join();
+    if (real_time_tcp_)
+    {
+        real_time_tcp_->close();
+    }
+    if (dash_board_tcp_)
+    {
+        dash_board_tcp_->close();
+    }
+    if (thread_ && thread_->joinable())
+    {
+        thread_->join();
+    }
 }
 
 void CRCommanderRos2::getCurrentJointStatus(double *joint)
@@ -177,7 +188,7 @@ void CRCommanderRos2::recvTask()
             catch (const TcpClientException &err)
             {
                 real_time_tcp_->disConnect();
-                std::cout << "tcp recv error :" << std::endl;
+                std::cout << "tcp recv error: " << err.what() << std::endl;
             }
         }
         else
@@ -188,9 +199,17 @@ void CRCommanderRos2::recvTask()
             }
             catch (const TcpClientException &err)
             {
-                std::cout << "tcp recv Error : %s" << std::endl;
-                sleep(3);
+                std::cout << "tcp connect error: " << err.what() << std::endl;
+                for (int i = 0; is_running_ && i < 30; ++i)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
             }
+        }
+
+        if (!is_running_)
+        {
+            break;
         }
 
         if (!dash_board_tcp_->isConnect())
@@ -201,9 +220,11 @@ void CRCommanderRos2::recvTask()
             }
             catch (const TcpClientException &err)
             {
-
-                std::cout << "tcp recv ERROR : %s" << std::endl;
-                sleep(3);
+                std::cout << "dashboard connect error: " << err.what() << std::endl;
+                for (int i = 0; is_running_ && i < 30; ++i)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
             }
         }
     }
@@ -218,7 +239,8 @@ void CRCommanderRos2::init()
     }
     catch (const TcpClientException &err)
     {
-        std::cout << "Commander : %s" << std::endl;
+        is_running_ = false;
+        std::cout << "Commander: " << err.what() << std::endl;
     }
 }
 int stringToInt(const std::string& str) {
@@ -239,6 +261,7 @@ void CRCommanderRos2::doTcpCmd(std::shared_ptr<TcpClient> &tcp, const char *cmd,
     }
     catch (const std::logic_error &err)
     {
+        tcp->disConnect();
         std::cout << "[dashboard] exception: cmd=" << cmd << ", error=" << err.what() << std::endl;
     }
 }
@@ -261,6 +284,7 @@ void CRCommanderRos2::doTcpCmd_f(std::shared_ptr<TcpClient> &tcp, const char *cm
     }
     catch (const std::logic_error &err)
     {
+        tcp->disConnect();
         std::cout << "[dashboard] exception: cmd=" << cmd << ", error=" << err.what() << std::endl;
     }
 }
@@ -275,7 +299,7 @@ bool CRCommanderRos2::callRosService(const std::string cmd, int32_t &err_id)
     }
     catch (const TcpClientException &err)
     {
-        std::cout << "%s" << std::endl;
+        std::cout << "dashboard service call failed: " << err.what() << std::endl;
         err_id = -1;
         return false;
     }
@@ -290,7 +314,7 @@ bool CRCommanderRos2::callRosService_f(const std::string cmd, int32_t &err_id,st
     }
     catch (const TcpClientException &err)
     {
-        std::cout << "%s" << std::endl;
+        std::cout << "dashboard service call failed: " << err.what() << std::endl;
         err_id = -1;
         return false;
     }
@@ -304,7 +328,7 @@ bool CRCommanderRos2::callRosService(const std::string cmd, int32_t &err_id, std
     }
     catch (const TcpClientException &err)
     {
-        std::cout << "%s" << std::endl;
+        std::cout << "dashboard service call failed: " << err.what() << std::endl;
         err_id = -1;
         return false;
     }

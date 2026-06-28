@@ -1,6 +1,0 @@
-view_mode: binarized
-overlay_enabled: true
-tray_dimension_tolerance_percent: 10
-seek_window_sec: 60
-seek_decay_sec: 1
-seek_valid_frames_confidence: 12

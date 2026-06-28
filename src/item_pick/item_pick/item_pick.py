@@ -12,11 +12,9 @@ from tkinter import scrolledtext
 
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from rclpy.time import Time
 
 from dobot_msgs_v4.srv import (
     DO,
@@ -25,17 +23,16 @@ from dobot_msgs_v4.srv import (
     MovJ,
     MovL,
     MovLIO,
-    RobotMode,
     SetTool,
     Stop,
     Tool,
     TrayInterceptStart,
 )
+from dobot_msgs_v4.msg import RobotStatus
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 from std_srvs.srv import SetBool, Trigger
-from tf2_ros import Buffer, TransformException, TransformListener
 from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 
 try:
@@ -89,6 +86,16 @@ def workspace_path(*parts: str) -> Path:
     return workspace_root().joinpath(*parts)
 
 
+def resolve_workspace_relative_path(value: str | Path, default: Path | None = None) -> Path:
+    text = str(value or '').strip()
+    if not text and default is not None:
+        return default
+    path = Path(text).expanduser()
+    if path.is_absolute():
+        return path
+    return workspace_path(str(path))
+
+
 SERVICE_ROOT_DEFAULT = '/dobot_bringup_ros2/srv'
 GRIPPER_DO_SERVICE_DEFAULT = f'{SERVICE_ROOT_DEFAULT}/DO'
 LINEAR_SPEED_MM_S_MIN = 50.0
@@ -103,10 +110,14 @@ SUCTION_SETTLE_SEC_MIN = 0.1
 SUCTION_SETTLE_SEC_MAX = 1.0
 TCP_FIELDS = ('x', 'y', 'z', 'rx', 'ry', 'rz')
 TCP_POSE_READ_TIMEOUT_SEC = 1.0
+TCP_POSE_IDLE_STABILITY_SEC = 0.1
+TCP_POSE_IDLE_WAIT_TIMEOUT_SEC = 5.0
 STARTUP_GET_POSE_CHECK_DELAY_SEC = 0.5
 STARTUP_GET_POSE_CHECK_TIMEOUT_SEC = 3.0
-ITEM_POSE_TOPIC = 'bin_seek_pose'
+ITEM_POSE_TOPIC = 'item_seek_pose'
 DI_STATUS_TOPIC_DEFAULT = '/dobot_bringup_ros2/DIStatus_200mS'
+ROBOT_STATUS_TOPIC_DEFAULT = 'dobot_msgs_v4/msg/RobotStatus'
+ROBOT_STATUS_FRESH_TIMEOUT_SEC = 0.75
 JOINT_STATE_TOPIC_DEFAULT = '/joint_states_robot'
 JOINT_STATE_FRESH_TIMEOUT_SEC = 1.0
 ROBOT_JOINT_READ_TIMEOUT_SEC = 5.0
@@ -163,8 +174,8 @@ REPICK_START_TIMEOUT_SEC = 30.0
 REPICK_JOINT_TOLERANCE_DEG = 1.0
 ACTION_EVENT_HISTORY_MAX = 500
 AUTO_REPICK_ON_FAILED_SUCTION_DEFAULT = True
-GOAL_TF_LOOKUP_TIMEOUT_SEC_DEFAULT = 0.2
 CAMERA_BIN_SAFE_MARGIN_MM_DEFAULT = 0.0
+INVALID_ORIENTATION_REPICK_MAX_REQUESTS = 3
 START_SEQUENCE_SERVICE_DEFAULT = 'item_pick/start_sequence'
 TRACK_SERVICE_DEFAULT = 'item_pick/track'
 TRACK_STATUS_SERVICE_DEFAULT = 'item_pick/track_status'
@@ -177,8 +188,13 @@ TOOL_OFFSET_PREVIEW_FRAME_DEFAULT = 'item_pick_tool_offset_preview'
 TOOL_OFFSET_PREVIEW_AXIS_X_TIP_FRAME_DEFAULT = 'item_pick_tool_offset_preview_axis_x_tip'
 TOOL_OFFSET_PREVIEW_AXIS_Y_TIP_FRAME_DEFAULT = 'item_pick_tool_offset_preview_axis_y_tip'
 TOOL_OFFSET_PREVIEW_AXIS_Z_TIP_FRAME_DEFAULT = 'item_pick_tool_offset_preview_axis_z_tip'
-RUNTIME_SETTINGS_PATH = workspace_path('config', 'item_perception', 'item_pick_runtime_settings.json')
-ITEM_PROFILE_STATE_PATH = workspace_path('config', 'item_perception', 'item_detect_selected_profile.txt')
+RUNTIME_SETTINGS_PATH = workspace_path('config', 'item_pick', 'item_pick_runtime_settings.json')
+ITEM_PROFILE_STATE_PATH = workspace_path(
+    'config',
+    'item_perception_yolo',
+    'item_detect_yolo_selected_profile.txt',
+)
+ITEM_PICK_ERROR_LOG_PATH = workspace_path('config', 'item_pick', 'item_pick_error.yaml')
 TOOL_TEACH_ROOT_KEY = 'tool_teach'
 TOOL_TEACH_FILE_SUFFIX = '_tool.yaml'
 RUNTIME_SETTINGS_SAVE_DEBOUNCE_MS = 250
@@ -518,6 +534,9 @@ class ItemPickNode(Node):
         self._runtime_settings_path = Path(
             str(self.declare_parameter('runtime_settings_file', str(RUNTIME_SETTINGS_PATH)).value)
         ).expanduser()
+        self._error_log_path = resolve_workspace_relative_path(
+            str(self.declare_parameter('error_log_file', str(ITEM_PICK_ERROR_LOG_PATH)).value)
+        )
         self._load_runtime_settings_on_start = bool(
             self.declare_parameter('load_runtime_settings', True).value
         )
@@ -544,12 +563,18 @@ class ItemPickNode(Node):
         self._di_status_topic = str(
             self.declare_parameter('di_status_topic', DI_STATUS_TOPIC_DEFAULT).value
         ).strip() or DI_STATUS_TOPIC_DEFAULT
+        self._robot_status_topic = str(
+            self.declare_parameter('robot_status_topic', ROBOT_STATUS_TOPIC_DEFAULT).value
+        ).strip() or ROBOT_STATUS_TOPIC_DEFAULT
         self._joint_state_topic = str(
             self.declare_parameter('joint_state_topic', JOINT_STATE_TOPIC_DEFAULT).value
         ).strip() or JOINT_STATE_TOPIC_DEFAULT
         self._di_status_bits = 0
         self._di_status_stamp: float | None = None
         self._di_status_parse_warning_logged = False
+        self._latest_robot_mode: int | None = None
+        self._latest_robot_status_stamp: float | None = None
+        self._latest_robot_status_connected = False
         self._joint_state_joints_deg: tuple[float, float, float, float, float, float] | None = None
         self._joint_state_stamp: float | None = None
         self._joint_state_warning_logged = False
@@ -580,6 +605,9 @@ class ItemPickNode(Node):
         self._manual_release_inflight = False
         self._repick_start_joints_deg: tuple[float, float, float, float, float, float] | None = None
         self._pick_attempt = 0
+        self._invalid_orientation_repick_requests = 0
+        self._last_goal_reject_message = ''
+        self._last_goal_reject_reacquire = False
         self._goal_tf_diagnose_inflight = False
         self._post_stop_movel_speed_mm_s = max(
             POST_STOP_MOVL_SPEED_MIN,
@@ -664,11 +692,24 @@ class ItemPickNode(Node):
         self._robot_gripper_frame_id = str(
             self.declare_parameter('robot_gripper_frame_id', ROBOT_GRIPPER_FRAME_DEFAULT).value
         ).strip() or ROBOT_GRIPPER_FRAME_DEFAULT
+        self._item_calibration_file = str(
+            self.declare_parameter('calibration_file', '').value
+        ).strip()
+        self._item_camera_parent_frame_id = self._robot_goal_frame_id
+        self._item_camera_frame_id = ''
+        self._item_camera_translation_m: tuple[float, float, float] | None = None
+        self._item_camera_rotation_xyzw: tuple[float, float, float, float] | None = None
+        self._platform_calibration_file = str(
+            self.declare_parameter('platform_calibration_file', '').value
+        ).strip()
         self._camera_safety_frame_id = str(
             self.declare_parameter('camera_safety_frame_id', CALIBRATED_CAMERA_FRAME_DEFAULT).value
         ).strip() or CALIBRATED_CAMERA_FRAME_DEFAULT
-        self._prefer_camera_inside_bin = bool(
-            self.declare_parameter('prefer_camera_inside_bin', True).value
+        self._camera_safety_calibration_file = str(
+            self.declare_parameter('camera_safety_calibration_file', '').value
+        ).strip()
+        self._publish_camera_safety_calibration_tf = bool(
+            self.declare_parameter('publish_camera_safety_calibration_tf', True).value
         )
         self._camera_bin_safe_margin_mm = max(
             0.0,
@@ -774,13 +815,6 @@ class ItemPickNode(Node):
         self._tool_offset_rz_deg = self._clamp_tool_offset_rotation_deg(
             float(self.declare_parameter('tool_offset_rz_deg', 0.0).value),
         )
-        self._goal_tf_lookup_timeout_sec = max(
-            0.01,
-            float(self.declare_parameter(
-                'goal_tf_lookup_timeout_sec',
-                GOAL_TF_LOOKUP_TIMEOUT_SEC_DEFAULT,
-            ).value),
-        )
         self._start_sequence_service_name = str(
             self.declare_parameter(
                 'start_sequence_service',
@@ -835,10 +869,6 @@ class ItemPickNode(Node):
             GetPose,
             f'{self._motion_service_root}/GetPose',
         )
-        self._robot_mode_client = self.create_client(
-            RobotMode,
-            f'{self._motion_service_root}/RobotMode',
-        )
         self._set_tool_client = self.create_client(
             SetTool,
             f'{self._motion_service_root}/SetTool',
@@ -859,10 +889,11 @@ class ItemPickNode(Node):
             Trigger,
             self._item_repick_service_name,
         )
-        self._tf_buffer = Buffer()
-        self._tf_listener = TransformListener(self._tf_buffer, self)
         self._goal_tf_static_broadcaster = StaticTransformBroadcaster(self)
         self._goal_static_tf_by_child: dict[str, TransformStamped] = {}
+        self._camera_safety_tf_static_broadcaster = StaticTransformBroadcaster(self)
+        self._camera_safety_static_tf: TransformStamped | None = None
+        self._camera_safety_offset_gripper_m: tuple[float, float, float] | None = None
         self._active_item_profile_key: str | None = None
         self._profile_state_mtime_ns: int | None = None
         self._active_profile_saved_tool_offsets: dict[str, float] | None = None
@@ -874,6 +905,7 @@ class ItemPickNode(Node):
         self._last_item_target: ItemPoseTarget | None = None
         self.create_subscription(PoseStamped, self._item_pose_topic, self._item_pose_callback, 10)
         self.create_subscription(String, self._di_status_topic, self._di_status_callback, 10)
+        self.create_subscription(RobotStatus, self._robot_status_topic, self._robot_status_callback, 10)
         self.create_subscription(JointState, self._joint_state_topic, self._joint_state_callback, 10)
         selected_profile_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -920,6 +952,8 @@ class ItemPickNode(Node):
                 f'{self._runtime_settings_path}'
             )
         self._sync_profile_tool_offsets_from_state(force=True)
+        self._load_item_pose_calibration_from_file()
+        self._load_camera_safety_calibration_from_file()
         self.get_logger().info(
             'Item pick mode configured: MovJ approach, MovLIO descent, suction settle at '
             'pick depth, MovL retract, DI1 confirmation, then MovL final Z-up.'
@@ -931,8 +965,22 @@ class ItemPickNode(Node):
         self.get_logger().info(f'Item detect repick service: {self._item_repick_service_name}')
         self.get_logger().info(f'Auto Repick service: {self._auto_repick_service_name}')
         self.get_logger().info(f'Item pose topic: {self._item_pose_topic}')
+        self.get_logger().info(f'Robot status topic: {self._robot_status_topic}')
         self.get_logger().info(f'Robot joint-state topic: {self._joint_state_topic}')
         self.get_logger().info(f'Item detect selected-profile topic: {self._selected_profile_topic}')
+        self.get_logger().info(
+            'Platform calibration for bin safety: '
+            + (self._platform_calibration_file or '<required when bin parent is not robot base>')
+        )
+        self.get_logger().info(
+            'Item pose calibration: '
+            + (
+                f'{self._item_camera_parent_frame_id}->{self._item_camera_frame_id} '
+                f'from {self._item_calibration_file}'
+                if self._item_camera_frame_id else
+                '<missing>'
+            )
+        )
         self.get_logger().info(f'Motion service root: {self._motion_service_root}')
         self.get_logger().info(
             f'TCP pose service: {self._motion_service_root}/GetPose '
@@ -955,7 +1003,9 @@ class ItemPickNode(Node):
             f'approach_z={self._approach_z_up_mm:.0f} mm, '
             f'final_z_up={self._final_z_up_mm:.0f} mm, '
             f'pick_motion_speed={self._pick_motion_speed_percent}%, '
-            f'suction_settle={self._suction_settle_sec:.1f}s'
+            f'suction_settle={self._suction_settle_sec:.1f}s, '
+            f'camera_safety={self._camera_safety_frame_id}, '
+            'camera_bin_safety=required'
         )
 
     def _reset_runtime_state_locked(self, reason: str) -> None:
@@ -967,6 +1017,9 @@ class ItemPickNode(Node):
         self._cancel_requested = False
         self._repick_start_joints_deg = None
         self._pick_attempt = 0
+        self._invalid_orientation_repick_requests = 0
+        self._last_goal_reject_message = ''
+        self._last_goal_reject_reacquire = False
         self._snapshot.busy = False
         self._record_action_locked(reason)
 
@@ -1018,7 +1071,10 @@ class ItemPickNode(Node):
     def _read_tcp_pose_once(
         self,
         timeout_sec: float = TCP_POSE_READ_TIMEOUT_SEC,
+        require_idle: bool = True,
     ) -> tuple[float, float, float, float, float, float] | None:
+        if require_idle and not self._wait_for_robot_idle_before_get_pose():
+            return None
         if not self._tcp_pose_read_lock.acquire(timeout=max(0.1, float(timeout_sec))):
             self._set_action_text('Timed out waiting for previous GetPose read to finish.')
             return None
@@ -1157,6 +1213,28 @@ class ItemPickNode(Node):
             self._di_status_stamp = time.time()
             self._di_status_parse_warning_logged = False
 
+    def _robot_status_callback(self, msg: RobotStatus) -> None:
+        connected = bool(getattr(msg, 'is_connected', True))
+        mode = int(getattr(msg, 'robot_mode', -1)) if connected else None
+        with self._lock:
+            self._latest_robot_mode = mode
+            self._latest_robot_status_connected = connected
+            self._latest_robot_status_stamp = time.monotonic()
+
+    def _fresh_robot_status_mode(
+        self,
+        max_age_sec: float = ROBOT_STATUS_FRESH_TIMEOUT_SEC,
+    ) -> int | None:
+        with self._lock:
+            mode = self._latest_robot_mode
+            stamp = self._latest_robot_status_stamp
+            connected = self._latest_robot_status_connected
+        if not connected or mode is None or stamp is None:
+            return None
+        if (time.monotonic() - stamp) > max(0.0, float(max_age_sec)):
+            return None
+        return mode
+
     @staticmethod
     def _joint_state_degrees_from_msg(
         msg: JointState,
@@ -1287,34 +1365,58 @@ class ItemPickNode(Node):
             f'{float(timeout_sec):.1f}s after retract.',
         )
 
-    @staticmethod
-    def _parse_robot_mode_code(raw_text: object) -> int | None:
-        values = re.findall(r'-?\d+', str(raw_text or ''))
-        if len(values) == 1:
-            return int(values[0])
-        return None
-
     def _read_robot_mode_code(self, timeout_sec: float = 0.5) -> int | None:
-        timeout_sec = max(0.1, float(timeout_sec))
-        if not self._robot_mode_client.wait_for_service(timeout_sec=min(0.2, timeout_sec)):
-            return None
+        del timeout_sec
+        topic_mode = self._fresh_robot_status_mode()
+        if topic_mode is None:
+            self._set_action_text(
+                f'No fresh RobotStatus mode on "{self._robot_status_topic}".'
+            )
+        return topic_mode
 
-        future = self._robot_mode_client.call_async(RobotMode.Request())
-        started = time.time()
-        while rclpy.ok() and not future.done():
-            if (time.time() - started) >= timeout_sec:
-                return None
-            time.sleep(0.02)
+    def _wait_for_robot_idle_before_get_pose(
+        self,
+        *,
+        stable_sec: float = TCP_POSE_IDLE_STABILITY_SEC,
+        timeout_sec: float = TCP_POSE_IDLE_WAIT_TIMEOUT_SEC,
+    ) -> bool:
+        self._set_action_text('Waiting for robot idle before reading TCP pose...')
+        deadline = time.monotonic() + max(0.1, float(timeout_sec))
+        stable_since: float | None = None
+        last_mode: int | None = None
 
-        if not future.done():
-            return None
-        exception = future.exception()
-        if exception is not None:
-            return None
-        response = future.result()
-        if response is None or int(getattr(response, 'res', -1)) < 0:
-            return None
-        return self._parse_robot_mode_code(getattr(response, 'robot_return', ''))
+        while rclpy.ok():
+            if self._is_cancel_requested():
+                self._set_action_text('Sequence cancelled before TCP pose read.')
+                return False
+
+            mode = self._read_robot_mode_code(timeout_sec=0.5)
+            if mode is not None:
+                last_mode = mode
+                if mode == ROBOT_MODE_ENABLED:
+                    if stable_since is None:
+                        stable_since = time.monotonic()
+                    elif (time.monotonic() - stable_since) >= max(0.0, float(stable_sec)):
+                        return True
+                elif mode in (ROBOT_MODE_RUNNING, ROBOT_MODE_JOGGING):
+                    stable_since = None
+                elif mode in (ROBOT_MODE_ERROR, ROBOT_MODE_PAUSED):
+                    self._set_action_text(f'Robot mode {mode}; TCP pose read blocked.')
+                    return False
+                else:
+                    stable_since = None
+
+            if time.monotonic() >= deadline:
+                mode_text = 'unknown' if last_mode is None else str(last_mode)
+                self._set_action_text(
+                    f'Timed out waiting for robot idle before TCP pose read '
+                    f'(last RobotStatus mode={mode_text}).'
+                )
+                return False
+            time.sleep(0.05)
+
+        self._set_action_text('ROS shutdown while waiting for robot idle before TCP pose read.')
+        return False
 
     def _wait_for_retract_motion_finished(
         self,
@@ -1366,7 +1468,7 @@ class ItemPickNode(Node):
                 mode_text = 'unknown' if last_mode is None else str(last_mode)
                 self._set_action_text(
                     f'Timed out waiting for {phase_label.lower()} completion '
-                    f'(last RobotMode={mode_text}, saw_running={saw_running}).'
+                    f'(last RobotStatus mode={mode_text}, saw_running={saw_running}).'
                 )
                 return False
             time.sleep(0.05)
@@ -1738,89 +1840,345 @@ class ItemPickNode(Node):
         except Exception:
             return None
 
-    def _load_active_bin_camera_safety_area(self) -> tuple[BinCameraSafetyArea | None, str]:
-        if not self._prefer_camera_inside_bin:
-            return None, 'camera-bin preference disabled'
-        if yaml is None:
-            return None, 'PyYAML unavailable; camera-bin preference skipped'
+    def _profile_ros_parameters(self, profile_root: object) -> dict[str, object]:
+        if not isinstance(profile_root, dict):
+            return {}
+        for root_key in ('item_detect', 'item_yolo', 'teach'):
+            params = self._yaml_map(self._yaml_map(profile_root, root_key), 'ros__parameters')
+            if params:
+                return params
+        return {}
 
-        active_profile_key = self._active_item_profile_key or self._read_active_item_profile_key()
+    def _platform_roi_corners_from_payload(
+        self,
+        payload: object,
+    ) -> tuple[str, list[tuple[float, float, float]]]:
+        roi_root = self._yaml_map(payload, 'platform_roi_corners')
+        frame_id = self._yaml_str(roi_root, 'coordinate_frame')
+        points_node = roi_root.get('points') if isinstance(roi_root, dict) else None
+        if not frame_id or not isinstance(points_node, list):
+            return '', []
+
+        points: list[tuple[float, float, float]] = []
+        for point_node in points_node:
+            if not isinstance(point_node, dict):
+                continue
+            point = self._yaml_xyz_m(self._yaml_map(point_node, 'position'))
+            if point is not None:
+                points.append(point)
+        return frame_id, points
+
+    @staticmethod
+    def _normalize_calibration_type(raw_value: object) -> str:
+        return str(raw_value or '').strip().lower().replace('-', '_')
+
+    def _load_item_pose_calibration_from_file(self) -> None:
+        if not self._item_calibration_file:
+            self._hard_fail(
+                'calibration_file is required for item pick item-pose conversion.',
+                error_kind='missing_item_pose_calibration_file',
+            )
+        if yaml is None:
+            self._hard_fail(
+                'Item pose calibration file was supplied, but PyYAML is unavailable; '
+                'cannot load eye-to-hand camera data.',
+                error_kind='yaml_unavailable',
+                calibration_file=self._item_calibration_file,
+            )
+
+        calibration_path = resolve_workspace_relative_path(self._item_calibration_file)
+        if not calibration_path.is_file():
+            self._hard_fail(
+                f'Item pose calibration file does not exist: {calibration_path}',
+                error_kind='missing_item_pose_calibration_file',
+                calibration_file=str(calibration_path),
+            )
+        try:
+            with calibration_path.open('r', encoding='utf-8') as infile:
+                root = yaml.safe_load(infile)
+        except Exception as exc:
+            self._hard_fail(
+                f'Could not read item pose calibration file "{calibration_path}": {exc}',
+                error_kind='invalid_item_pose_calibration_file',
+                calibration_file=str(calibration_path),
+            )
+        if not isinstance(root, dict):
+            self._hard_fail(
+                f'Item pose calibration file "{calibration_path}" is not a YAML map.',
+                error_kind='invalid_item_pose_calibration_file',
+                calibration_file=str(calibration_path),
+            )
+
+        params = self._yaml_map(root, 'parameters')
+        calibration_type = self._normalize_calibration_type(
+            self._yaml_str(params, 'calibration_type')
+        )
+        if calibration_type not in ('eye_on_base', 'eye_to_hand', 'eyetohand'):
+            self._hard_fail(
+                f'Item pose calibration file "{calibration_path}" is not eye-to-hand '
+                f'(calibration_type={calibration_type or "<missing>"}).',
+                error_kind='wrong_item_pose_calibration_type',
+                calibration_file=str(calibration_path),
+                calibration_type=calibration_type,
+            )
+
+        transform = self._yaml_map(root, 'transform')
+        translation = self._yaml_xyz_m(self._yaml_map(transform, 'translation'))
+        rotation = self._yaml_xyzw_quaternion(self._yaml_map(transform, 'rotation'))
+        if translation is None or rotation is None:
+            self._hard_fail(
+                f'Item pose calibration file "{calibration_path}" has no usable transform.',
+                error_kind='invalid_item_pose_calibration_transform',
+                calibration_file=str(calibration_path),
+            )
+
+        parent_frame = self._yaml_str(params, 'transform_parent_frame')
+        child_frame = self._yaml_str(params, 'transform_child_frame')
+        if not parent_frame:
+            self._hard_fail(
+                f'Item pose calibration file "{calibration_path}" is missing '
+                'parameters.transform_parent_frame.',
+                error_kind='invalid_item_pose_calibration_frame',
+                calibration_file=str(calibration_path),
+            )
+        if not child_frame:
+            self._hard_fail(
+                f'Item pose calibration file "{calibration_path}" is missing '
+                'parameters.transform_child_frame.',
+                error_kind='invalid_item_pose_calibration_frame',
+                calibration_file=str(calibration_path),
+            )
+        if parent_frame != self._robot_goal_frame_id:
+            self._hard_fail(
+                f'Item pose calibration parent is "{parent_frame}", expected '
+                f'"{self._robot_goal_frame_id}".',
+                error_kind='item_pose_calibration_frame_mismatch',
+                calibration_file=str(calibration_path),
+                parent_frame=parent_frame,
+                expected_parent_frame=self._robot_goal_frame_id,
+            )
+
+        self._item_calibration_file = str(calibration_path)
+        self._item_camera_parent_frame_id = parent_frame
+        self._item_camera_frame_id = child_frame
+        self._item_camera_translation_m = translation
+        self._item_camera_rotation_xyzw = rotation
+        self.get_logger().info(
+            f'Loaded item pose calibration directly from "{calibration_path.name}": '
+            f'{parent_frame} -> {child_frame}.'
+        )
+
+    def _load_camera_safety_calibration_from_file(self) -> None:
+        if not self._camera_safety_calibration_file:
+            self._hard_fail(
+                'camera_safety_calibration_file is required for camera-bin safety.',
+                error_kind='missing_camera_safety_calibration_file',
+            )
+        if yaml is None:
+            self._hard_fail(
+                'Camera safety calibration file was supplied, but PyYAML is unavailable; '
+                'cannot load eye-on-hand camera safety data.',
+                error_kind='yaml_unavailable',
+                camera_safety_calibration_file=self._camera_safety_calibration_file,
+            )
+
+        calibration_path = resolve_workspace_relative_path(self._camera_safety_calibration_file)
+        if not calibration_path.is_file():
+            self._hard_fail(
+                f'Camera safety calibration file does not exist: {calibration_path}',
+                error_kind='missing_camera_safety_calibration_file',
+                camera_safety_calibration_file=str(calibration_path),
+            )
+        try:
+            with calibration_path.open('r', encoding='utf-8') as infile:
+                root = yaml.safe_load(infile)
+        except Exception as exc:
+            self._hard_fail(
+                f'Could not read camera safety calibration file "{calibration_path}": {exc}',
+                error_kind='invalid_camera_safety_calibration_file',
+                camera_safety_calibration_file=str(calibration_path),
+            )
+        if not isinstance(root, dict):
+            self._hard_fail(
+                f'Camera safety calibration file "{calibration_path}" is not a YAML map.',
+                error_kind='invalid_camera_safety_calibration_file',
+                camera_safety_calibration_file=str(calibration_path),
+            )
+
+        params = self._yaml_map(root, 'parameters')
+        calibration_type = self._normalize_calibration_type(
+            self._yaml_str(params, 'calibration_type')
+        )
+        if calibration_type not in ('eye_in_hand', 'eye_on_hand', 'eyeonhand'):
+            self._hard_fail(
+                f'Camera safety calibration file "{calibration_path}" is not eye-on-hand '
+                f'(calibration_type={calibration_type or "<missing>"}).',
+                error_kind='wrong_camera_safety_calibration_type',
+                camera_safety_calibration_file=str(calibration_path),
+                calibration_type=calibration_type,
+            )
+
+        transform = self._yaml_map(root, 'transform')
+        translation = self._yaml_xyz_m(self._yaml_map(transform, 'translation'))
+        rotation = self._yaml_xyzw_quaternion(self._yaml_map(transform, 'rotation'))
+        if translation is None or rotation is None:
+            self._hard_fail(
+                f'Camera safety calibration file "{calibration_path}" has no usable transform.',
+                error_kind='invalid_camera_safety_calibration_transform',
+                camera_safety_calibration_file=str(calibration_path),
+            )
+
+        parent_frame = self._yaml_str(params, 'transform_parent_frame')
+        child_frame = self._yaml_str(params, 'transform_child_frame')
+        if not parent_frame:
+            self._hard_fail(
+                f'Camera safety calibration file "{calibration_path}" is missing '
+                'parameters.transform_parent_frame.',
+                error_kind='invalid_camera_safety_calibration_frame',
+                camera_safety_calibration_file=str(calibration_path),
+            )
+        if not child_frame:
+            self._hard_fail(
+                f'Camera safety calibration file "{calibration_path}" is missing '
+                'parameters.transform_child_frame.',
+                error_kind='invalid_camera_safety_calibration_frame',
+                camera_safety_calibration_file=str(calibration_path),
+            )
+        if parent_frame != self._robot_gripper_frame_id:
+            self._hard_fail(
+                f'Camera safety calibration parent is "{parent_frame}", expected '
+                f'"{self._robot_gripper_frame_id}".',
+                error_kind='camera_safety_calibration_frame_mismatch',
+                camera_safety_calibration_file=str(calibration_path),
+                parent_frame=parent_frame,
+                expected_parent_frame=self._robot_gripper_frame_id,
+            )
+        if child_frame != self._camera_safety_frame_id:
+            self._hard_fail(
+                f'Camera safety calibration child is "{child_frame}", expected '
+                f'"{self._camera_safety_frame_id}".',
+                error_kind='camera_safety_calibration_frame_mismatch',
+                camera_safety_calibration_file=str(calibration_path),
+                child_frame=child_frame,
+                expected_child_frame=self._camera_safety_frame_id,
+            )
+        self._camera_safety_offset_gripper_m = translation
+
+        self.get_logger().info(
+            f'Loaded required camera safety offset from "{calibration_path.name}": '
+            f'{parent_frame} -> {child_frame}.'
+        )
+        if not self._publish_camera_safety_calibration_tf:
+            return
+
+        tf_msg = TransformStamped()
+        tf_msg.header.stamp = self.get_clock().now().to_msg()
+        tf_msg.header.frame_id = parent_frame
+        tf_msg.child_frame_id = child_frame
+        tf_msg.transform.translation.x = translation[0]
+        tf_msg.transform.translation.y = translation[1]
+        tf_msg.transform.translation.z = translation[2]
+        tf_msg.transform.rotation.x = rotation[0]
+        tf_msg.transform.rotation.y = rotation[1]
+        tf_msg.transform.rotation.z = rotation[2]
+        tf_msg.transform.rotation.w = rotation[3]
+        self._camera_safety_static_tf = tf_msg
+        self._camera_safety_tf_static_broadcaster.sendTransform(tf_msg)
+        self.get_logger().info(
+            f'Published camera safety calibration TF from "{calibration_path.name}": '
+            f'{parent_frame} -> {child_frame}.'
+        )
+
+    def _load_platform_calibration_transform_from_file(
+        self,
+        platform_calibration_text: str,
+        expected_parent_frame: str,
+        expected_child_frame: str,
+    ) -> tuple[
+        tuple[float, float, float],
+        tuple[float, float, float, float],
+        str,
+    ] | tuple[None, None, str]:
+        platform_path = resolve_workspace_relative_path(platform_calibration_text)
+        platform_root = self._safe_yaml_load(platform_path)
+        if not platform_root:
+            return None, None, f'could not read platform calibration "{platform_path}"'
+
+        platform_tf = self._yaml_map(platform_root, 'transform')
+        if not platform_tf:
+            return None, None, f'platform calibration "{platform_path}" has no transform'
+        metadata = self._yaml_map(platform_root, 'metadata')
+        metadata_parent = self._yaml_str(metadata, 'transform_parent_frame')
+        metadata_child = self._yaml_str(metadata, 'transform_child_frame')
+        if metadata_parent and metadata_parent != expected_parent_frame:
+            return None, None, (
+                f'platform calibration parent "{metadata_parent}" is not '
+                f'"{expected_parent_frame}"'
+            )
+        if metadata_child and metadata_child != expected_child_frame:
+            return None, None, (
+                f'platform calibration child "{metadata_child}" is not expected ROI frame '
+                f'"{expected_child_frame}"'
+            )
+
+        translation = self._yaml_xyz_m(self._yaml_map(platform_tf, 'translation'))
+        rotation = self._yaml_xyzw_quaternion(self._yaml_map(platform_tf, 'rotation'))
+        if translation is None or rotation is None:
+            return None, None, f'could not read platform calibration "{platform_path}"'
+        return translation, rotation, f'platform calibration "{platform_path.name}"'
+
+    def _load_active_bin_camera_safety_area(self) -> tuple[BinCameraSafetyArea | None, str]:
+        if yaml is None:
+            return None, 'PyYAML unavailable'
+
+        active_profile_key = self._active_item_profile_key
         if not active_profile_key:
-            return None, 'no active item profile; camera-bin preference skipped'
+            return None, 'no active item profile'
 
         profile_path = Path(active_profile_key).expanduser()
         profile_root = self._safe_yaml_load(profile_path)
-        profile_params = self._yaml_map(self._yaml_map(profile_root, 'item_detect'), 'ros__parameters')
+        profile_params = self._profile_ros_parameters(profile_root)
         bin_teach_text = self._yaml_str(profile_params, 'bin_teach_file')
         if not bin_teach_text:
             return None, f'active profile "{profile_path.name}" has no bin_teach_file'
 
-        bin_teach_path = companion_yaml_path_for_profile(profile_path, bin_teach_text, 'bin_teach')
+        configured_bin_teach = Path(bin_teach_text).expanduser()
+        bin_teach_path = (
+            configured_bin_teach
+            if configured_bin_teach.is_absolute()
+            else profile_path.parent / configured_bin_teach
+        )
         bin_root = self._safe_yaml_load(bin_teach_path)
         bin_data = self._yaml_map(bin_root, 'bin_teach')
         if not bin_data:
             return None, f'could not read bin teach file "{bin_teach_path}"'
 
-        parent_frame = self._yaml_str(bin_data, 'parent_frame')
-        bin_frame_id = self._yaml_str(bin_data, 'bin_frame', 'bin_frame')
-        transform = self._yaml_map(bin_data, 'transform')
-        parent_to_bin_t = self._yaml_xyz_m(self._yaml_map(transform, 'translation'))
-        parent_to_bin_q = self._yaml_xyzw_quaternion(self._yaml_map(transform, 'rotation'))
-        if parent_to_bin_t is None or parent_to_bin_q is None:
-            return None, f'bin teach file "{bin_teach_path.name}" has no usable parent->bin transform'
-
-        base_to_parent_t = (0.0, 0.0, 0.0)
-        base_to_parent_q = (0.0, 0.0, 0.0, 1.0)
-        if parent_frame and parent_frame != self._robot_goal_frame_id:
-            platform_ref = self._yaml_map(bin_data, 'platform_reference')
-            platform_calibration_text = self._yaml_str(platform_ref, 'platform_calibration_file')
-            if not platform_calibration_text:
-                return None, f'bin parent "{parent_frame}" is not "{self._robot_goal_frame_id}" and has no platform calibration file'
-
-            platform_path = Path(platform_calibration_text).expanduser()
-            platform_root = self._safe_yaml_load(platform_path)
-            platform_tf = self._yaml_map(platform_root, 'transform')
-            if not platform_tf:
-                platform_tf = self._yaml_map(platform_root, 'calibration_transform')
-            metadata = self._yaml_map(platform_root, 'metadata')
-            metadata_parent = self._yaml_str(metadata, 'transform_parent_frame')
-            metadata_child = self._yaml_str(metadata, 'transform_child_frame')
-            if metadata_parent and metadata_parent != self._robot_goal_frame_id:
-                return None, (
-                    f'platform calibration parent "{metadata_parent}" is not '
-                    f'"{self._robot_goal_frame_id}"'
-                )
-            if metadata_child and metadata_child != parent_frame:
-                return None, (
-                    f'platform calibration child "{metadata_child}" is not bin parent '
-                    f'"{parent_frame}"'
-                )
-            base_to_parent_t = self._yaml_xyz_m(self._yaml_map(platform_tf, 'translation'))
-            base_to_parent_q = self._yaml_xyzw_quaternion(self._yaml_map(platform_tf, 'rotation'))
-            if base_to_parent_t is None or base_to_parent_q is None:
-                return None, f'could not read platform calibration "{platform_path}"'
-
-        base_to_bin_t, base_to_bin_q = self._compose_transform_m(
-            base_to_parent_t,
-            base_to_parent_q,
-            parent_to_bin_t,
-            parent_to_bin_q,
-        )
-
-        marker_positions = self._yaml_map(bin_data, 'marker_positions')
-        marker_points_bin: list[tuple[float, float, float]] = []
-        for marker_pose in marker_positions.values():
-            marker_parent = self._yaml_xyz_m(marker_pose)
-            if marker_parent is None:
-                continue
-            marker_points_bin.append(
-                self._transform_point_inverse_m(marker_parent, parent_to_bin_t, parent_to_bin_q)
+        roi_frame_id, roi_parent_points = self._platform_roi_corners_from_payload(bin_data)
+        if not roi_frame_id or len(roi_parent_points) != 4:
+            return None, (
+                f'bin teach file "{bin_teach_path.name}" must contain exactly 4 '
+                'platform_roi_corners points'
             )
-        if len(marker_points_bin) < 3:
-            return None, f'bin teach file "{bin_teach_path.name}" has fewer than 3 marker positions'
 
-        x_values = [point[0] for point in marker_points_bin]
-        y_values = [point[1] for point in marker_points_bin]
+        if roi_frame_id == self._robot_goal_frame_id:
+            base_to_roi_t = (0.0, 0.0, 0.0)
+            base_to_roi_q = (0.0, 0.0, 0.0, 1.0)
+        else:
+            if not self._platform_calibration_file:
+                return None, (
+                    f'bin ROI frame "{roi_frame_id}" is not "{self._robot_goal_frame_id}"; '
+                    'platform_calibration_file is required'
+                )
+            base_to_roi_t, base_to_roi_q, platform_reason = self._load_platform_calibration_transform_from_file(
+                self._platform_calibration_file,
+                self._robot_goal_frame_id,
+                roi_frame_id,
+            )
+            if base_to_roi_t is None or base_to_roi_q is None:
+                return None, platform_reason
+
+        x_values = [point[0] for point in roi_parent_points]
+        y_values = [point[1] for point in roi_parent_points]
         x_min = min(x_values)
         x_max = max(x_values)
         y_min = min(y_values)
@@ -1831,15 +2189,15 @@ class ItemPickNode(Node):
         return BinCameraSafetyArea(
             profile_path=profile_path,
             bin_teach_path=bin_teach_path,
-            bin_frame_id=bin_frame_id,
-            base_to_bin_translation_m=base_to_bin_t,
-            base_to_bin_rotation_xyzw=base_to_bin_q,
+            bin_frame_id=roi_frame_id,
+            base_to_bin_translation_m=base_to_roi_t,
+            base_to_bin_rotation_xyzw=base_to_roi_q,
             x_min_m=x_min + margin_m,
             x_max_m=x_max - margin_m,
             y_min_m=y_min + margin_m,
             y_max_m=y_max - margin_m,
             margin_m=margin_m,
-        ), f'camera-bin preference loaded from "{bin_teach_path.name}"'
+        ), f'camera-bin safety loaded from "{bin_teach_path.name}"'
 
     def _read_tool_teach_sidecar_payload(self, active_profile_key: str) -> dict[str, object] | None:
         embedded_payload = embedded_tool_teach_payload_from_profile(active_profile_key)
@@ -2296,29 +2654,32 @@ class ItemPickNode(Node):
         tuple[float, float, float, float],
     ] | None:
         source_frame = str(camera_frame_id).strip() or 'camera_color_optical_frame'
-        target_frame = self._robot_goal_frame_id
-        try:
-            tf_msg = self._tf_buffer.lookup_transform(
-                target_frame,
-                source_frame,
-                Time(),
-                timeout=Duration(seconds=self._goal_tf_lookup_timeout_sec),
+        if self._item_camera_translation_m is None or self._item_camera_rotation_xyzw is None:
+            message = 'Item pose calibration is not loaded.'
+            self._set_action_text(message)
+            self._write_error_datalog(
+                message,
+                error_kind='item_pose_calibration_not_loaded',
+                calibration_file=self._item_calibration_file,
             )
-        except TransformException as exc:
-            self._set_action_text(f'TF lookup failed {target_frame}<-{source_frame}: {exc}')
+            return None
+        if source_frame != self._item_camera_frame_id:
+            message = (
+                f'Item pose frame "{source_frame}" does not match calibration child frame '
+                f'"{self._item_camera_frame_id}".'
+            )
+            self._set_action_text(message)
+            self._write_error_datalog(
+                message,
+                error_kind='item_pose_frame_mismatch',
+                item_pose_frame=source_frame,
+                expected_frame=self._item_camera_frame_id,
+                calibration_file=self._item_calibration_file,
+            )
             return None
 
-        q_base_camera = self._quat_normalize((
-            float(tf_msg.transform.rotation.x),
-            float(tf_msg.transform.rotation.y),
-            float(tf_msg.transform.rotation.z),
-            float(tf_msg.transform.rotation.w),
-        ))
-        t_base_camera_m = (
-            float(tf_msg.transform.translation.x),
-            float(tf_msg.transform.translation.y),
-            float(tf_msg.transform.translation.z),
-        )
+        q_base_camera = self._item_camera_rotation_xyzw
+        t_base_camera_m = self._item_camera_translation_m
         p_camera_item_m = (
             float(item_x_mm) * 0.001,
             float(item_y_mm) * 0.001,
@@ -2349,24 +2710,10 @@ class ItemPickNode(Node):
         )
 
     def _lookup_camera_offset_in_gripper_m(self) -> tuple[float, float, float] | None:
-        try:
-            tf_msg = self._tf_buffer.lookup_transform(
-                self._robot_gripper_frame_id,
-                self._camera_safety_frame_id,
-                Time(),
-                timeout=Duration(seconds=self._goal_tf_lookup_timeout_sec),
-            )
-        except TransformException as exc:
-            self.get_logger().warn(
-                f'Camera-bin preference skipped: TF lookup failed '
-                f'{self._robot_gripper_frame_id}<-{self._camera_safety_frame_id}: {exc}'
-            )
-            return None
-        return (
-            float(tf_msg.transform.translation.x),
-            float(tf_msg.transform.translation.y),
-            float(tf_msg.transform.translation.z),
-        )
+        if self._camera_safety_offset_gripper_m is not None:
+            return self._camera_safety_offset_gripper_m
+        self.get_logger().error('Camera-bin safety error: camera safety calibration data unavailable.')
+        return None
 
     def _camera_position_for_goal_m(
         self,
@@ -2405,17 +2752,40 @@ class ItemPickNode(Node):
         preferred_index: int,
         q_base_goal_candidates: tuple[tuple[float, float, float, float], ...],
         candidate_goal_xyz_mm: tuple[tuple[float, float, float], ...],
-    ) -> tuple[int, str]:
-        if not self._prefer_camera_inside_bin or len(q_base_goal_candidates) <= 1:
-            return preferred_index, ''
+    ) -> tuple[int | None, str, bool]:
+        if len(q_base_goal_candidates) <= 1:
+            message = 'Camera-bin safety blocked pick: expected preferred and 180deg pose candidates.'
+            self.get_logger().error(message)
+            self._set_action_text(message)
+            self._write_error_datalog(
+                message,
+                error_kind='missing_camera_orientation_candidates',
+            )
+            return None, message, False
 
         safety_area, safety_reason = self._load_active_bin_camera_safety_area()
         if safety_area is None:
-            return preferred_index, safety_reason
+            message = f'Camera-bin safety blocked pick: {safety_reason}'
+            self.get_logger().error(message)
+            self._set_action_text(message)
+            self._write_error_datalog(
+                message,
+                error_kind='missing_camera_bin_safety_area',
+                reason=safety_reason,
+            )
+            return None, message, False
 
         camera_offset_gripper_m = self._lookup_camera_offset_in_gripper_m()
         if camera_offset_gripper_m is None:
-            return preferred_index, 'camera-bin preference skipped: camera TF unavailable'
+            message = 'Camera-bin safety blocked pick: camera safety calibration unavailable'
+            self.get_logger().error(message)
+            self._set_action_text(message)
+            self._write_error_datalog(
+                message,
+                error_kind='camera_safety_calibration_not_loaded',
+                camera_safety_calibration_file=self._camera_safety_calibration_file,
+            )
+            return None, message, False
 
         checks: list[tuple[bool, tuple[float, float, float]]] = []
         for idx, q_goal in enumerate(q_base_goal_candidates):
@@ -2432,7 +2802,7 @@ class ItemPickNode(Node):
                 f'Camera-bin preference: preferred pose keeps {self._camera_safety_frame_id} '
                 f'inside {safety_area.bin_frame_id} '
                 f'(x={preferred_bin_m[0] * 1000.0:.1f}, y={preferred_bin_m[1] * 1000.0:.1f} mm).'
-            )
+            ), False
 
         for idx, (inside, camera_bin_m) in enumerate(checks):
             if idx == preferred_index or not inside:
@@ -2445,16 +2815,29 @@ class ItemPickNode(Node):
                 f'(x={camera_bin_m[0] * 1000.0:.1f}, y={camera_bin_m[1] * 1000.0:.1f} mm).'
             )
             self.get_logger().info(message)
-            return idx, message
+            return idx, message, False
 
-        message = (
-            f'Camera-bin preference warning: both item-X pose options put '
-            f'{self._camera_safety_frame_id} outside {safety_area.bin_frame_id}; '
-            f'continuing with preferred pick anyway '
-            f'(x={preferred_bin_m[0] * 1000.0:.1f}, y={preferred_bin_m[1] * 1000.0:.1f} mm).'
+        candidate_details = ', '.join(
+            f'candidate {idx}: x={camera_bin_m[0] * 1000.0:.1f}, '
+            f'y={camera_bin_m[1] * 1000.0:.1f} mm'
+            for idx, (_, camera_bin_m) in enumerate(checks)
         )
-        self.get_logger().warn(message)
-        return preferred_index, message
+        detail = (
+            f'both item-X pose options put {self._camera_safety_frame_id} '
+            f'outside {safety_area.bin_frame_id}; predicted camera positions '
+            f'({candidate_details}).'
+        )
+        message = 'Camera-bin safety blocked pick: ' + detail
+        self.get_logger().error(message)
+        self._set_action_text(message)
+        self._write_error_datalog(
+            message,
+            error_kind='camera_outside_bin_roi_both_orientations',
+            bin_frame_id=safety_area.bin_frame_id,
+            camera_safety_frame_id=self._camera_safety_frame_id,
+            candidate_details=candidate_details,
+        )
+        return None, message, True
 
     def _publish_goal_debug_transform(
         self,
@@ -2705,6 +3088,27 @@ class ItemPickNode(Node):
             )
             worker.start()
 
+    def _clear_goal_reject_reason(self) -> None:
+        with self._lock:
+            self._last_goal_reject_message = ''
+            self._last_goal_reject_reacquire = False
+
+    def _set_goal_reject_reason(
+        self,
+        message: str,
+        reacquire_item_pose: bool = False,
+    ) -> None:
+        with self._lock:
+            self._last_goal_reject_message = str(message).strip()
+            self._last_goal_reject_reacquire = bool(reacquire_item_pose)
+
+    def _goal_reject_snapshot(self) -> tuple[str, bool]:
+        with self._lock:
+            return (
+                str(self._last_goal_reject_message).strip(),
+                bool(self._last_goal_reject_reacquire),
+            )
+
     def _compute_base_goal_from_item_target(
         self,
         item_target: ItemPoseTarget,
@@ -2720,6 +3124,7 @@ class ItemPickNode(Node):
         ee_speed_mmps: float,
         predict_target_motion: bool = True,
     ) -> PredictedGoal | None:
+        self._clear_goal_reject_reason()
         _ = ee_speed_mmps
         _ = predict_target_motion
         target_x, target_y, target_z = item_target.position_mm
@@ -2735,6 +3140,7 @@ class ItemPickNode(Node):
             frame_id,
         )
         if item_base_pose is None:
+            self._set_goal_reject_reason('Could not transform item pose into robot base frame.')
             return None
 
         item_base_x, item_base_y, item_base_z, _, _, _, q_base_item, _ = item_base_pose
@@ -2790,6 +3196,9 @@ class ItemPickNode(Node):
         )
         preferred_candidate_idx = self._choose_min_rotation_candidate_index(q_base_goal_candidates)
         if preferred_candidate_idx is None:
+            self._set_goal_reject_reason(
+                'Could not read a stable TCP pose before pick-orientation selection.'
+            )
             return None
         candidate_goal_xyz_mm = tuple(
             (
@@ -2799,11 +3208,16 @@ class ItemPickNode(Node):
             )
             for _ in q_base_goal_candidates
         )
-        selected_candidate_idx, camera_safety_message = self._choose_camera_preferred_candidate_index(
-            preferred_candidate_idx,
-            q_base_goal_candidates,
-            candidate_goal_xyz_mm,
+        selected_candidate_idx, camera_safety_message, reacquire_item_pose = (
+            self._choose_camera_preferred_candidate_index(
+                preferred_candidate_idx,
+                q_base_goal_candidates,
+                candidate_goal_xyz_mm,
+            )
         )
+        if selected_candidate_idx is None:
+            self._set_goal_reject_reason(camera_safety_message, reacquire_item_pose)
+            return None
         q_base_nominal_goal = q_base_nominal_candidates[selected_candidate_idx]
         q_base_goal = q_base_goal_candidates[selected_candidate_idx]
         target_x_goal, target_y_goal, target_z_goal = candidate_goal_xyz_mm[selected_candidate_idx]
@@ -3362,6 +3776,87 @@ class ItemPickNode(Node):
                     remaining_sec = watch_timeout_sec
             time.sleep(min(0.1, max(0.02, remaining_sec)))
 
+    def _request_new_pose_after_invalid_orientation(self, reason: str) -> bool:
+        reason_text = str(reason).strip() or 'both final goal orientations are invalid'
+        max_requests = INVALID_ORIENTATION_REPICK_MAX_REQUESTS
+        with self._lock:
+            if self._cancel_requested:
+                self._record_action_locked('Sequence cancelled before requesting a new item pose.')
+                return False
+            if self._invalid_orientation_repick_requests >= max_requests:
+                message = (
+                    'No valid item to pick: both final goal orientations remained invalid '
+                    f'after {max_requests} item-detect repick requests. '
+                    f'Item pick stopped; node remains alive. Last rejection: {reason_text}'
+                )
+                self._reset_runtime_state_locked(message)
+                exhausted_message = message
+                generation = 0
+                request_number = 0
+            else:
+                self._invalid_orientation_repick_requests += 1
+                request_number = int(self._invalid_orientation_repick_requests)
+                generation = self._arm_item_pose_watch_locked()
+                self._snapshot.busy = True
+                self._record_action_locked(
+                    'No valid orientation for current item pose. '
+                    f'Requesting fresh item pose {request_number}/{max_requests}... '
+                    f'Reason: {reason_text}'
+                )
+                exhausted_message = ''
+
+        if exhausted_message:
+            self.get_logger().error(exhausted_message)
+            self._write_error_datalog(
+                exhausted_message,
+                error_kind='invalid_orientation_repick_exhausted',
+                reason=reason_text,
+                max_requests=max_requests,
+            )
+            return False
+
+        self.get_logger().warn(
+            'Both final goal orientations are invalid for the current item pose; '
+            f'requesting item_detect repick {request_number}/{max_requests}. '
+            f'Reason: {reason_text}'
+        )
+        watchdog = threading.Thread(
+            target=self._item_pose_watchdog_worker,
+            args=(generation,),
+            daemon=True,
+        )
+        watchdog.start()
+
+        if not self._call_trigger_service(
+            self._item_repick_client,
+            self._item_repick_service_name,
+            timeout_sec=5.0,
+        ):
+            message = (
+                'Item detect repick request failed after invalid pick orientation. '
+                'No valid item to pick; item pick stopped and node remains alive.'
+            )
+            self.get_logger().error(message)
+            self._write_error_datalog(
+                message,
+                error_kind='item_detect_repick_request_failed',
+                reason=reason_text,
+                service_name=self._item_repick_service_name,
+            )
+            self._reset_runtime_state(message)
+            return False
+
+        with self._lock:
+            if (
+                self._item_pose_watch_generation == generation
+                and self._item_pose_watch_armed
+            ):
+                self._record_action_locked(
+                    f'Invalid orientation retry {request_number}/{max_requests}: '
+                    'waiting for a newly acquired item pose. Seek remains ON.'
+                )
+        return True
+
     def _send_movel_request(
         self,
         item_target: ItemPoseTarget,
@@ -3421,7 +3916,14 @@ class ItemPickNode(Node):
                 post_speed_mm_s,
             )
             if base_goal is None:
+                reject_message, reacquire_item_pose = self._goal_reject_snapshot()
+                if reacquire_item_pose:
+                    self._request_new_pose_after_invalid_orientation(reject_message)
                 return
+            with self._lock:
+                self._invalid_orientation_repick_requests = 0
+                self._last_goal_reject_message = ''
+                self._last_goal_reject_reacquire = False
             if self._is_cancel_requested():
                 self._set_action_text('Sequence cancelled during goal computation.')
                 return
@@ -3529,19 +4031,30 @@ class ItemPickNode(Node):
                 self._set_action_text(suction_message)
                 return
             if not suction_active:
-                self._set_action_text(
-                    f'{suction_message} Pickup not confirmed; final Z-up skipped. Seek remains ON.'
-                )
                 with self._lock:
                     auto_repick_on_failed_suction = bool(self._auto_repick_on_failed_suction)
                 if not auto_repick_on_failed_suction:
+                    self._set_action_text(
+                        f'{suction_message} Pickup not confirmed; final Z-up skipped. '
+                        'Auto repick disabled; purging and releasing Seek...'
+                    )
                     if not self._gripper_purge_exhaust(PICK_PURGE_EXHAUST_MS):
                         return
-                    self._set_action_text(
-                        f'{suction_message} Pickup not confirmed; auto repick disabled. '
-                        'Standby with Seek still ON.'
-                    )
+                    seek_complete_notified = self._notify_item_detect_seek_complete()
+                    if seek_complete_notified:
+                        self._set_action_text(
+                            f'{suction_message} Pickup not confirmed; auto repick disabled. '
+                            'Seek released; standby with Seek OFF.'
+                        )
+                    else:
+                        self._set_action_text(
+                            f'{suction_message} Pickup not confirmed; auto repick disabled. '
+                            'Seek release failed; standby with Seek still ON.'
+                        )
                     return
+                self._set_action_text(
+                    f'{suction_message} Pickup not confirmed; final Z-up skipped. Seek remains ON.'
+                )
                 if not self._execute_release_pulse(automatic=True):
                     return
                 if not self._restart_item_pick_after_failed_suction():
@@ -3634,6 +4147,30 @@ class ItemPickNode(Node):
     def _set_action_text(self, text: str) -> None:
         with self._lock:
             self._record_action_locked(text)
+
+    def _write_error_datalog(self, message: str, *, error_kind: str, **details: object) -> None:
+        payload = {
+            'node': 'item_pick',
+            'error_kind': str(error_kind),
+            'error': str(message),
+            'details': {
+                key: value
+                for key, value in details.items()
+                if value not in (None, '')
+            },
+            'time_unix_sec': time.time(),
+        }
+        try:
+            self._error_log_path.parent.mkdir(parents=True, exist_ok=True)
+            text = yaml.safe_dump(payload, sort_keys=False) if yaml is not None else json.dumps(payload, indent=2)
+            self._error_log_path.write_text(text, encoding='utf-8')
+        except Exception as exc:
+            self.get_logger().error(f'Failed to write item pick error datalog: {exc}')
+        self.get_logger().error(message)
+
+    def _hard_fail(self, message: str, *, error_kind: str, **details: object) -> None:
+        self._write_error_datalog(message, error_kind=error_kind, **details)
+        raise RuntimeError(message)
 
     def _set_busy(self, busy: bool) -> None:
         with self._lock:
@@ -4052,6 +4589,9 @@ class ItemPickNode(Node):
             with self._lock:
                 self._repick_start_joints_deg = None
                 self._pick_attempt = 0
+                self._invalid_orientation_repick_requests = 0
+                self._last_goal_reject_message = ''
+                self._last_goal_reject_reacquire = False
                 self._snapshot.busy = False
                 self._manual_stop_inflight = False
 
@@ -4192,6 +4732,9 @@ class ItemPickNode(Node):
             self._cancel_requested = False
             self._repick_start_joints_deg = None
             self._pick_attempt = 0
+            self._invalid_orientation_repick_requests = 0
+            self._last_goal_reject_message = ''
+            self._last_goal_reject_reacquire = False
             self._item_pose_watch_timeout_sec = max(
                 ITEM_POSE_WATCH_TIMEOUT_MIN,
                 min(ITEM_POSE_WATCH_TIMEOUT_MAX, float(item_pose_watch_timeout_sec)),

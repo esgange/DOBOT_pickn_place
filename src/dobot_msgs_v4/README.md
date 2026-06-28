@@ -19,12 +19,12 @@ source install/setup.bash
 | --- | --- |
 | `RobotStatus.msg` | Robot status, mode, safety, and controller state fields. |
 | `ToolVectorActual.msg` | Actual TCP/tool pose feedback from the robot controller. |
-| `TrayVector.msg` | Tray pose, timing, velocity, and motion direction used by tray intercept. |
+| `TrayVector.msg` | Legacy tray motion estimate message; current tray detect/intercept handoff uses `geometry_msgs/msg/PoseStamped` on `tray_target_pose`. |
 
 `RobotStatus.msg` includes controller connectivity, the raw DOBOT
 `robot_mode`, and `is_idle` for the normal enabled-idle mode (`5`).
 
-`TrayVector.msg` includes:
+`TrayVector.msg` is kept for compatibility with older tooling. It includes:
 
 - tray pose in millimeters and degrees;
 - first/last observation timestamps;
@@ -77,8 +77,8 @@ from dobot_msgs_v4.msg import ToolVectorActual
 
 - `cr_robot_ros2` implements service servers for the controller API.
 - `motion_debug` uses core motion, state, and IO services.
-- `tray_perception` publishes `TrayVector`.
-- `tray_intercept` consumes `TrayVector` and exposes `TrayInterceptStart`.
+- `tray_perception` publishes `tray_target_pose` as `geometry_msgs/msg/PoseStamped`.
+- `tray_intercept` consumes `tray_target_pose` and exposes `TrayInterceptStart`.
 - `item_pick` reuses `TrayInterceptStart` for its operator service.
 
 ## Notes

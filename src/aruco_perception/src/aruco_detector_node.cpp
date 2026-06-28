@@ -103,6 +103,11 @@ ArucoDetectorNode::ArucoDetectorNode()
   publish_overlay_ = this->declare_parameter<bool>("publish_overlay", true);
   publish_viz_ = publish_overlay_ || show_overlay_window_;
   overlay_rate_hz_ = this->declare_parameter<double>("overlay_rate_hz", 10.0);
+  show_bin_roi_dots_overlay_ = this->declare_parameter<bool>("show_bin_roi_dots_overlay", false);
+  bin_roi_allowed_marker_ids_ = this->declare_parameter<std::vector<int64_t>>(
+    "bin_roi_allowed_marker_ids", std::vector<int64_t>{1, 2, 3, 4});
+  bin_roi_required_marker_count_ = this->declare_parameter<int>("bin_roi_required_marker_count", 4);
+  bin_roi_required_marker_count_ = std::max(1, bin_roi_required_marker_count_);
   depth_colormap_max_ = 1.5;
   overlay_axis_scale_ = DEFAULT_AXIS_SCALE;
   overlay_axis_min_len_ = DEFAULT_AXIS_MIN_LEN;
@@ -800,6 +805,8 @@ void ArucoDetectorNode::publishOverlay(const rclcpp::Time &stamp, const cv::Mat 
     }
   }
 
+  drawBinRoiDotsOverlay(color_overlay, depth_overlay, markers);
+
   cv::Mat stacked;
   cv::vconcat(color_overlay, depth_overlay, stacked);
 
@@ -839,6 +846,157 @@ void ArucoDetectorNode::publishOverlay(const rclcpp::Time &stamp, const cv::Mat 
     processOverlayWindowEvents();
   }
   last_overlay_render_time_ = std::chrono::steady_clock::now();
+}
+
+void ArucoDetectorNode::drawBinRoiDotsOverlay(
+  cv::Mat &color_overlay, cv::Mat &depth_overlay,
+  const std::vector<MarkerPose> &markers) const
+{
+  if (!show_bin_roi_dots_overlay_ || markers.empty() || bin_roi_required_marker_count_ <= 0)
+  {
+    return;
+  }
+
+  std::vector<const MarkerPose *> selected;
+  selected.reserve(static_cast<size_t>(bin_roi_required_marker_count_));
+  for (const auto &marker : markers)
+  {
+    if (std::find(
+          bin_roi_allowed_marker_ids_.begin(),
+          bin_roi_allowed_marker_ids_.end(),
+          static_cast<int64_t>(marker.id)) == bin_roi_allowed_marker_ids_.end())
+    {
+      continue;
+    }
+    if (marker.image_corners.size() < 4)
+    {
+      continue;
+    }
+    selected.push_back(&marker);
+    if (static_cast<int>(selected.size()) >= bin_roi_required_marker_count_)
+    {
+      break;
+    }
+  }
+
+  if (static_cast<int>(selected.size()) < bin_roi_required_marker_count_)
+  {
+    return;
+  }
+
+  cv::Point2f center_px(0.0F, 0.0F);
+  for (const auto *marker : selected)
+  {
+    cv::Point2f marker_center(0.0F, 0.0F);
+    for (const auto &corner : marker->image_corners)
+    {
+      marker_center += corner;
+    }
+    marker_center *= (1.0F / static_cast<float>(marker->image_corners.size()));
+    center_px += marker_center;
+  }
+  center_px *= (1.0F / static_cast<float>(selected.size()));
+
+  std::vector<cv::Point> points;
+  points.reserve(selected.size());
+  for (const auto *marker : selected)
+  {
+    size_t outside_index = 0;
+    double best_distance = -1.0;
+    for (size_t index = 0; index < 4; ++index)
+    {
+      const cv::Point2f delta = marker->image_corners[index] - center_px;
+      const double distance = static_cast<double>(delta.x) * static_cast<double>(delta.x) +
+                              static_cast<double>(delta.y) * static_cast<double>(delta.y);
+      if (distance > best_distance)
+      {
+        best_distance = distance;
+        outside_index = index;
+      }
+    }
+    const auto &corner = marker->image_corners[outside_index];
+    points.emplace_back(
+      static_cast<int>(std::lround(corner.x)),
+      static_cast<int>(std::lround(corner.y)));
+  }
+
+  if (points.size() < 3)
+  {
+    return;
+  }
+
+  cv::Point2d point_center(0.0, 0.0);
+  for (const auto &point : points)
+  {
+    point_center.x += static_cast<double>(point.x);
+    point_center.y += static_cast<double>(point.y);
+  }
+  point_center.x /= static_cast<double>(points.size());
+  point_center.y /= static_cast<double>(points.size());
+
+  std::sort(
+    points.begin(), points.end(),
+    [&point_center](const cv::Point &a, const cv::Point &b) {
+      const double angle_a = std::atan2(
+        static_cast<double>(a.y) - point_center.y,
+        static_cast<double>(a.x) - point_center.x);
+      const double angle_b = std::atan2(
+        static_cast<double>(b.y) - point_center.y,
+        static_cast<double>(b.x) - point_center.x);
+      return angle_a < angle_b;
+    });
+
+  const auto start_it = std::min_element(
+    points.begin(), points.end(),
+    [](const cv::Point &a, const cv::Point &b) {
+      return (a.x + a.y) < (b.x + b.y);
+    });
+  std::rotate(points.begin(), start_it, points.end());
+  if (points.size() >= 4 && points[1].x < points.back().x)
+  {
+    std::reverse(points.begin() + 1, points.end());
+  }
+
+  const cv::Scalar line_color(255, 255, 0);
+  const cv::Scalar fill_color(255, 0, 255);
+  const cv::Scalar text_color(255, 255, 255);
+  const cv::Scalar shadow_color(0, 0, 0);
+
+  auto draw_points = [&](cv::Mat &image) {
+    std::vector<cv::Point> clipped_points;
+    clipped_points.reserve(points.size());
+    for (const auto &point : points)
+    {
+      clipped_points.emplace_back(
+        std::clamp(point.x, 0, std::max(0, image.cols - 1)),
+        std::clamp(point.y, 0, std::max(0, image.rows - 1)));
+    }
+
+    const std::vector<std::vector<cv::Point>> polygon{clipped_points};
+    cv::polylines(image, polygon, true, line_color, 4, cv::LINE_AA);
+    for (size_t index = 0; index < clipped_points.size(); ++index)
+    {
+      const auto &point = clipped_points[index];
+      cv::circle(image, point, 24, shadow_color, -1, cv::LINE_AA);
+      cv::circle(image, point, 18, fill_color, -1, cv::LINE_AA);
+      cv::circle(image, point, 27, text_color, 3, cv::LINE_AA);
+      cv::drawMarker(image, point, text_color, cv::MARKER_CROSS, 34, 3, cv::LINE_AA);
+
+      const std::string label = "dot " + std::to_string(index + 1);
+      const cv::Point label_point(
+        std::clamp(point.x + 24, 4, std::max(4, image.cols - 90)),
+        std::clamp(point.y - 24, 24, std::max(24, image.rows - 8)));
+      cv::putText(
+        image, label, label_point, cv::FONT_HERSHEY_SIMPLEX, 0.72,
+        shadow_color, 5, cv::LINE_AA);
+      cv::putText(
+        image, label, label_point, cv::FONT_HERSHEY_SIMPLEX, 0.72,
+        text_color, 2, cv::LINE_AA);
+    }
+  };
+
+  draw_points(color_overlay);
+  draw_points(depth_overlay);
 }
 
 void ArucoDetectorNode::renderNoCameraTopicsOverlay()

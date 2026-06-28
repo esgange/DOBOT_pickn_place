@@ -79,7 +79,13 @@ def generate_launch_description():
     model_root = LaunchConfiguration("model_root")
     depth_topic = LaunchConfiguration("depth_topic")
     camera_info_topic = LaunchConfiguration("camera_info_topic")
+    projection_camera_frame = LaunchConfiguration("projection_camera_frame")
     overlay_topic = LaunchConfiguration("overlay_topic")
+    calibration_dir = LaunchConfiguration("calibration_dir")
+    calibration_file = LaunchConfiguration("calibration_file")
+    platform_calibration_file = LaunchConfiguration("platform_calibration_file")
+    robot_ip_address = LaunchConfiguration("robot_ip_address")
+    publish_static_calibration_tfs = LaunchConfiguration("publish_static_calibration_tfs")
     camera_control_service_root = LaunchConfiguration("camera_control_service_root")
     color_exposure_min_us = LaunchConfiguration("color_exposure_min_us")
     color_exposure_max_us = LaunchConfiguration("color_exposure_max_us")
@@ -125,7 +131,17 @@ def generate_launch_description():
         DeclareLaunchArgument("model_root", default_value=_repo_path("teach", "item_teach_yolo")),
         DeclareLaunchArgument("depth_topic", default_value=BIN_CAMERA_DEPTH_TOPIC),
         DeclareLaunchArgument("camera_info_topic", default_value=BIN_CAMERA_INFO_TOPIC),
+        DeclareLaunchArgument("projection_camera_frame", default_value="bin_calibrated_camera_link"),
         DeclareLaunchArgument("overlay_topic", default_value="bin_overlay"),
+        DeclareLaunchArgument("calibration_dir", default_value=_repo_path("calibration")),
+        DeclareLaunchArgument("calibration_file", default_value=""),
+        DeclareLaunchArgument("platform_calibration_file", default_value=""),
+        DeclareLaunchArgument(
+            "robot_ip_address",
+            default_value="",
+            description="Robot controller IP for calibration file discovery. Empty uses ROBOT_IP_ADDRESS/station_config.",
+        ),
+        DeclareLaunchArgument("publish_static_calibration_tfs", default_value="true"),
         DeclareLaunchArgument("camera_control_service_root", default_value=BIN_CAMERA_CONTROL_SERVICE_ROOT),
         DeclareLaunchArgument("color_exposure_min_us", default_value="1"),
         DeclareLaunchArgument("color_exposure_max_us", default_value="100"),
@@ -173,7 +189,14 @@ def generate_launch_description():
                     "model_root": model_root,
                     "depth_topic": depth_topic,
                     "camera_info_topic": camera_info_topic,
+                    "projection_camera_frame": projection_camera_frame,
                     "overlay_topic": overlay_topic,
+                    "calibration_dir": calibration_dir,
+                    "calibration_file": calibration_file,
+                    "platform_calibration_file": platform_calibration_file,
+                    "robot_ip_address": robot_ip_address,
+                    "publish_static_calibration_tfs": ParameterValue(
+                        publish_static_calibration_tfs, value_type=bool),
                     "camera_control_service_root": camera_control_service_root,
                     "color_exposure_min_us": ParameterValue(color_exposure_min_us, value_type=int),
                     "color_exposure_max_us": ParameterValue(color_exposure_max_us, value_type=int),

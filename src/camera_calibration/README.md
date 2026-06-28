@@ -217,7 +217,7 @@ Mode comes from the filename. Camera calibration readers expect this `transform`
 schema.
 
 The output is compatible with `aruco_perception`, `tray_perception`,
-`item_perception`, and `obstacle_perception`.
+`item_perception_yolo`, and `obstacle_perception`.
 
 Saving a camera calibration deletes older files only when both the calibration
 mode and robot-IP filename suffix match. Legacy no-IP files and files for other

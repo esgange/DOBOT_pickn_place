@@ -145,7 +145,7 @@ Executable: `item_teach_yolo_node.py`
   Ultralytics.
 - Promotion creates a final detector-ready teach bundle under
   `WORKSPACE_ROOT/teach/item_teach_yolo/item_<item>[_bin_<bin>]_<ddmmyyyy>`.
-- The final bundle contains `best.onnx` and
+- The final bundle contains `best.pt` and
   `item_<item>[_bin_<bin>]_<ddmmyyyy>.yaml`.
 - Saved teach sessions are stored under
   `WORKSPACE_ROOT/config/item_perception_yolo/item_teach_yolo_saved_sessions`.
@@ -162,7 +162,7 @@ Executable: `item_detect_yolo_node.py`
   `WORKSPACE_ROOT/config/item_perception_yolo/item_detect_yolo_selected_model.txt`.
 - Defaults to the same `/bin_camera` topics as YOLO teach and, by default, uses
   the camera topics stored in the selected trained profile.
-- Uses the classic non-YOLO item-detect top-bar UI but opens YOLO ONNX/model
+- Uses the classic non-YOLO item-detect top-bar UI but opens YOLO `.pt` model
   bundles with `Open Model`; sibling YAML metadata supplies ROI, bin plane,
   camera topics, item name, and teach joints when available.
 - Deletes selected YOLO teach bundles from
@@ -221,10 +221,23 @@ Executable: `camera_launcher_gui`
   `WORKSPACE_ROOT/config/camera_bringup/orbbec_cameras.yaml`.
 - Preserves and uses the `orbbec_launch_args` block in the same YAML as the
   editable `orbbec_camera gemini_330_series.launch.py` launch argument set.
+- Creates transient terminal PID marker files under
+  `WORKSPACE_ROOT/runtime/orbbec_camera_launcher_pids` while capturing visible
+  launch process groups; those PID files are removed immediately after capture.
 - Trigger: `Save Mapping` and `Launch Cameras`; launch saves the mapping before
   starting the two Orbbec launch processes.
 - Starts `orbbec_camera gemini_330_series.launch.py` subprocesses by
   `serial_number` and `camera_name`, but does not write camera image/depth data.
+- Stop/Close sends shutdown signals to tracked launch process groups and sweeps
+  still-running configured Orbbec process groups by saved camera name, preventing
+  hidden camera drivers from continuing to stream after the launcher is closed.
+
+Executable: `camera_watchdog`
+
+- Owns supervised Orbbec launch subprocesses in separate process groups.
+- Publishes health/status topics and restarts stale or exited camera drivers
+  with bounded backoff.
+- Does not write project files; shutdown stops owned driver process groups.
 
 ### `motion_debug`
 

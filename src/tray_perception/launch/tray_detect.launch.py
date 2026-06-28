@@ -214,7 +214,7 @@ def _launch_setup(context, *args, **kwargs):
     )
     tray_pose_topic = LaunchConfiguration("tray_pose_topic").perform(context)
     tray_axis_overlay_topic = LaunchConfiguration("tray_axis_overlay_topic").perform(context)
-    tray_vector_topic = LaunchConfiguration("tray_vector_topic").perform(context)
+    tray_target_pose_topic = LaunchConfiguration("tray_target_pose_topic").perform(context)
 
     use_calibration = _to_bool(LaunchConfiguration("use_calibration").perform(context))
     parent_frame = LaunchConfiguration("parent_frame").perform(context)
@@ -289,7 +289,7 @@ def _launch_setup(context, *args, **kwargs):
             "depth_exposure_max_us": depth_exposure_max_us,
             "tray_pose_topic": tray_pose_topic,
             "tray_axis_overlay_topic": tray_axis_overlay_topic,
-            "tray_vector_topic": tray_vector_topic,
+            "tray_target_pose_topic": tray_target_pose_topic,
             "profiles_dir": profiles_dir,
             "selected_profile_path": selected_profile_path,
             "runtime_settings_file": runtime_settings_file,
@@ -409,8 +409,8 @@ def generate_launch_description():
             default_value="tray_axis_overlay",
         ),
         DeclareLaunchArgument(
-            "tray_vector_topic",
-            default_value="tray_vector",
+            "tray_target_pose_topic",
+            default_value="tray_target_pose",
         ),
         DeclareLaunchArgument(
             "use_calibration",

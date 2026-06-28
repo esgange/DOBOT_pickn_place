@@ -81,7 +81,7 @@ nc -vz <conveyor-pc-ip> 5672
 3. Source the workspace and start the bridge:
 
    ```bash
-   cd /home/erds/DOBOT_pickn_place
+   cd "$HOME/DOBOT_pickn_place"
    source /opt/ros/humble/setup.bash
    source install/setup.bash
    source tools/deps/source_third_party_env.sh

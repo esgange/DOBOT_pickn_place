@@ -15,8 +15,10 @@
 #include <rclcpp/node.hpp>
 #include <rclcpp/executor.hpp>
 #include <nlohmann/json.hpp>
+#include <atomic>
 #include <string>
 #include <memory>
+#include <thread>
 #include <dobot_bringup/parseTool.h>
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <rclcpp_action/create_server.hpp>
@@ -118,6 +120,7 @@ class CRRobotRos2 : public rclcpp::Node
 {
 public:
     CRRobotRos2();
+    ~CRRobotRos2() override;
     void init();
     static void execute_action(const std::shared_ptr<dobot_msgs_v4::srv::EnableRobot::Request> request,
                                std::shared_ptr<dobot_msgs_v4::srv::EnableRobot::Response> response);
@@ -327,6 +330,7 @@ private:
 private:
     std::string kRobotName;
     std::shared_ptr<CRCommanderRos2> commander_;
+    std::atomic<bool> is_running_{false};
     std::thread threadPubFeedBackInfo;
     std::thread threadPub200mSDIStatus;
 };

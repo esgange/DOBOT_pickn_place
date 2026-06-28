@@ -2,14 +2,17 @@
 
 `item_perception_yolo` is the YOLO/SAM2 branch of the DOBOT item perception
 stack. It teaches ROI-masked YOLO11 segmentation samples from SAM2 prompts,
-trains a YOLO11-seg model, exports an ONNX model, and runs the YOLO detector.
+trains a YOLO11-seg model, promotes the trained `.pt` weights, and runs the
+YOLO detector.
 
 ## Nodes
 
 | Node | Purpose |
 | --- | --- |
+| `bin_teach_yolo_node.py` | ArUco-based bin teach generator that saves portable `platform_reference` bin YAMLs. |
 | `item_teach_yolo_node.py` | SAM2 prompt-based teach UI that saves YOLO11 segmentation samples and trains a YOLO11-seg model. |
-| `item_detect_yolo_node.py` | Runtime YOLO11 segmentation detector. It loads ONNX profiles, runs ROI-crop inference on CPU, and publishes item pose outputs/services. |
+| `item_detect_yolo_node.py` | Runtime YOLO11/YOLO26-compatible segmentation detector. It loads `.pt` profiles, runs ROI-crop inference with Ultralytics on CPU, and publishes item pose outputs/services. |
+| `item_detect_yolo_debug_node.py` | Offline ONNX/PT sample-image tester for quickly checking YOLO masks before using the runtime detector. |
 
 ## Build
 
@@ -33,11 +36,17 @@ python -c "import torch, torchvision, ultralytics, onnxruntime, sam2"
 
 ## Launch
 
-Teach or update a bin ROI first with the classic item perception package:
+Create or update a platform-relative bin teach YAML:
 
 ```bash
-ros2 launch item_perception bin_teach.launch.py
+ros2 launch item_perception_yolo bin_teach_yolo.launch.py
 ```
+
+Bin teach uses the first four visible ArUco detections whose IDs are in
+`allowed_marker_ids` (`1,2,3,4` by default; duplicate IDs are allowed). It saves
+the outside corner from each marker in `platform_reference`, so the same bin
+teach file can be projected through another robot station's platform
+calibration.
 
 Teach YOLO11 segmentation samples with SAM2 prompts:
 
@@ -77,7 +86,7 @@ must pass `calibration_file` explicitly.
 
 The YOLO detector keeps the external ROS node name `item_detect`, so existing
 topics/services such as `item_detect/seek`, `item_detect/repick`,
-`item_detect/seek_complete`, `item_detect/seek_status`, `bin_seek_pose`, and
+`item_detect/seek_complete`, `item_detect/seek_status`, `item_seek_pose`, and
 `bin_item_poses` remain compatible with `item_pick`.
 
 With `use_calibration:=true`, YOLO detect must publish item poses in the
@@ -89,11 +98,11 @@ TF path from `base_link` to the pose frame.
 
 For Item Pick handoff, YOLO detect also publishes the loaded profile YAML on
 the latched `item_detect/selected_profile` topic and writes the same path to
-`config/item_perception/item_detect_selected_profile.txt`. The ONNX model path
-is still written separately to the YOLO-specific selected-model file.
+`config/item_perception_yolo/item_detect_yolo_selected_profile.txt`. The `.pt`
+model path is written separately to the YOLO-specific selected-model file.
 
 Seek behavior matches non-YOLO item detect: Seek toggles ON/OFF with
-`item_detect/seek`, the first valid pose is published once to `bin_seek_pose`,
+`item_detect/seek`, the first valid pose is published once to `item_seek_pose`,
 Seek stays logically ON in a latched handoff state, `item_detect/repick`
 reacquires without toggling Seek OFF, and only `item_detect/seek_complete`
 releases Seek after Item Pick final Z-up.
@@ -106,10 +115,31 @@ without extra launch arguments.
 The detect window mirrors the classic non-YOLO `item_detect` operator UI:
 `View`, `Overlay`, `Seek`, `Debug Img`, `Go To Teach`, `Open Model`, and
 `Delete Item` live in the same top-bar layout. `Open Model` selects a YOLO
-ONNX/model bundle; if a sibling YAML profile exists, detect uses it for ROI,
-bin depth plane, camera topics, item name, and teach joints. Without that YAML,
-detect can still run the model on the full frame, but plane alignment and
-`Go To Teach` metadata are unavailable.
+`.pt` model bundle; a sibling YAML profile points to the bin teach file and
+supplies camera topics, item name, and teach joints. The ROI is regenerated
+from platform-referenced bin teach geometry.
+
+Debug a custom ONNX or PT model against saved samples without using the live camera:
+
+```bash
+ros2 launch item_perception_yolo item_detect_yolo_debug.launch.py
+```
+
+The debug UI can open a custom `.onnx` or `.pt` file, open one sample image, or
+open a folder of samples. If `samples_path` is not supplied, it scans current YOLO
+teach runtime/saved-session folders and trained bundle folders for images. It
+runs CPU ONNX Runtime for `.onnx` models and Ultralytics for `.pt` models on
+the selected image, then overlays masks, boxes, class IDs, confidence, and
+inference time. It shows all classes by default; pass `class_id:=0` or another
+class number to focus on one class. `.pt` tests run on CPU by default; pass
+`pt_device:=0` to use GPU 0 when available. Launch with explicit paths when
+needed:
+
+```bash
+ros2 launch item_perception_yolo item_detect_yolo_debug.launch.py \
+  model_path:=/abs/path/to/best.pt \
+  samples_path:=/abs/path/to/sample_folder
+```
 
 ## YOLO Teach Workflow
 
@@ -162,6 +192,10 @@ exits. Saved sessions are kept under:
 WORKSPACE_ROOT/config/item_perception_yolo/item_teach_yolo_saved_sessions
 ```
 
+Inside each teach session, ROI captures and review metadata are stored in the
+top-level `images/` folder. YOLO training samples remain separate under
+`dataset/images/train` and `dataset/labels/train`.
+
 After training, the final detector-ready bundle is promoted into one folder
 under:
 
@@ -175,23 +209,32 @@ Bundle folders follow the item/bin/date naming standard:
 item_<item>[_bin_<bin>]_<ddmmyyyy>/
 ```
 
-Each bundle contains `best.onnx` and
+Each bundle contains `best.pt` and
 `item_<item>[_bin_<bin>]_<ddmmyyyy>.yaml`. The profile stores camera topics,
-ROI points, bin association, depth plane data from `bin_teach`, model paths,
-training metadata, item/background sample counts, and teach joints.
+the associated bin teach file, model paths, training metadata,
+item/background sample counts, and teach joints. Detect projects the platform
+ROI corners in the bin teach YAML through the active robot platform calibration.
 
 ## Detection
 
 The detector auto-loads YOLO bundles from `teach/item_teach_yolo`, can open a
-YOLO ONNX model directly with `Open Model`, runs ONNX Runtime CPU inference on
-the selected bin ROI or full frame, selects the highest-confidence mask while
-Seek is armed, and publishes:
+YOLO `.pt` model directly with `Open Model`, and runs Ultralytics CPU inference
+on the selected bin ROI. Item detect infers compatibility from the `.pt` path:
+names containing `26` use `yolo26_seg_pt`, names containing `11` use
+`yolo11_seg_pt`, and ambiguous names are rejected. Every `.pt` must have a
+paired YAML. When opening a `.pt` such as `kwosant_yolo26.pt`, item detect
+requires a YAML beginning with the item token before `_yolo##`, for example
+`kwosant_bin_big_bin_14062026.yaml`.
+Live YOLO inference starts OFF; use the top-right `YOLO: ON/OFF` button to
+toggle it. If Seek or Repick is triggered while YOLO is OFF, detect turns YOLO
+ON automatically so it can acquire the item pose. While Seek is armed, it
+selects the highest-confidence mask and publishes:
 
 | Topic | Type | Notes |
 | --- | --- | --- |
 | `bin_overlay` | `sensor_msgs/msg/Image` | Debug/preview image. |
 | `bin_item_poses` | `geometry_msgs/msg/PoseArray` | All valid per-mask item poses. |
-| `bin_seek_pose` | `geometry_msgs/msg/PoseStamped` | Selected seek pose. |
+| `item_seek_pose` | `geometry_msgs/msg/PoseStamped` | Selected seek pose. |
 | `bin_cube_marker` | `visualization_msgs/msg/Marker` | RViz marker for visualization. |
 
 Detection defaults to the bin camera stream under `/bin_camera`. Override

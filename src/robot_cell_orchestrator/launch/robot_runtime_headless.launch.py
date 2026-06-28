@@ -157,15 +157,15 @@ def _stringify(value) -> str:
     return str(value)
 
 
-def _load_settings(path: Path) -> dict:
+def _load_settings(path: Path, label: str = 'Headless runtime settings') -> dict:
     if yaml is None:
-        raise RuntimeError('PyYAML is required to read the headless runtime settings file.')
+        raise RuntimeError(f'PyYAML is required to read the {label}.')
     if not path.exists():
-        raise RuntimeError(f'Headless runtime settings file does not exist: {path}')
+        raise RuntimeError(f'{label} file does not exist: {path}')
     with path.open('r', encoding='utf-8') as infile:
         payload = yaml.safe_load(infile)
     if not isinstance(payload, dict):
-        raise RuntimeError(f'Headless runtime settings file is not a YAML map: {path}')
+        raise RuntimeError(f'{label} file is not a YAML map: {path}')
     return payload
 
 
@@ -269,6 +269,32 @@ def _existing_file(path_text: str, label: str) -> str:
     return path_text
 
 
+def _settings_path_from_launch(context, workspace_root: Path, arg_name: str) -> Path:
+    settings_path = Path(_launch_value(context, arg_name)).expanduser()
+    if not settings_path.is_absolute():
+        settings_path = workspace_root / settings_path
+    return settings_path.resolve()
+
+
+def _orchestrator_runtime_path(
+    context,
+    orchestrator_settings: dict,
+    workspace_root: Path,
+    arg_name: str,
+    key: str,
+    label: str,
+) -> str:
+    override = _launch_value(context, arg_name)
+    raw_value = override if override else orchestrator_settings.get(key, '')
+    path_text = _path_text(raw_value, workspace_root)
+    if not path_text:
+        raise RuntimeError(
+            f'{label} must be selected in Robot Cell Orchestrator UI setting '
+            f'"{key}" or provided with launch override "{arg_name}:=<path>".'
+        )
+    return _existing_file(path_text, label)
+
+
 def _yaml_has_top_level_key(path: Path, key: str) -> bool:
     try:
         with path.open('r', encoding='utf-8') as infile:
@@ -340,10 +366,50 @@ def _add_optional_passthrough(
 def _launch_setup(context, *args, **kwargs):
     del args, kwargs
     workspace_root = _workspace_root()
-    settings_path = Path(_launch_value(context, 'runtime_settings_file')).expanduser()
-    if not settings_path.is_absolute():
-        settings_path = workspace_root / settings_path
-    settings = _load_settings(settings_path.resolve())
+    settings_path = _settings_path_from_launch(context, workspace_root, 'runtime_settings_file')
+    settings = _load_settings(settings_path, 'Headless runtime settings')
+    orchestrator_settings_path = _settings_path_from_launch(
+        context,
+        workspace_root,
+        'orchestrator_runtime_settings_file',
+    )
+    orchestrator_settings = _load_settings(
+        orchestrator_settings_path,
+        'Robot Cell Orchestrator runtime settings',
+    )
+
+    eye_on_hand_calibration_file = _orchestrator_runtime_path(
+        context,
+        orchestrator_settings,
+        workspace_root,
+        'calibration_file',
+        'eye_on_hand_calibration_file',
+        'Eye-on-hand calibration',
+    )
+    eye_to_hand_calibration_file = _orchestrator_runtime_path(
+        context,
+        orchestrator_settings,
+        workspace_root,
+        'item_calibration_file',
+        'eye_to_hand_calibration_file',
+        'Eye-to-hand calibration',
+    )
+    platform_calibration_file = _orchestrator_runtime_path(
+        context,
+        orchestrator_settings,
+        workspace_root,
+        'platform_calibration_file',
+        'platform_calibration_file',
+        'Platform calibration',
+    )
+    item_pick_camera_safety_calibration_file = _orchestrator_runtime_path(
+        context,
+        orchestrator_settings,
+        workspace_root,
+        'camera_safety_calibration_file',
+        'eye_on_hand_calibration_file',
+        'Item-pick camera safety calibration',
+    )
 
     mode = _setting(context, settings, workspace_root, 'mode', 'mode').lower()
     if mode not in ('online', 'offline'):
@@ -437,7 +503,7 @@ def _launch_setup(context, *args, **kwargs):
     common_calibration_args = {
         'use_calibration': _setting(context, settings, workspace_root, 'use_calibration', 'common.use_calibration'),
         'calibration_dir': _setting(context, settings, workspace_root, 'calibration_dir', 'common.calibration_dir', path=True),
-        'calibration_file': _optional_setting(context, settings, workspace_root, 'calibration_file', 'common.calibration_file', path=True),
+        'calibration_file': eye_on_hand_calibration_file,
         'parent_frame': _setting(context, settings, workspace_root, 'calibration_parent_frame', 'common.calibration_parent_frame'),
         'child_frame': _setting(context, settings, workspace_root, 'calibration_child_frame', 'common.calibration_child_frame'),
         'camera_frame': _optional_setting(context, settings, workspace_root, 'camera_frame', 'common.camera_frame'),
@@ -462,16 +528,8 @@ def _launch_setup(context, *args, **kwargs):
             'common.calibration_dir',
             path=True,
         ),
-        'calibration_file': _optional_setting_with_fallback(
-            context,
-            settings,
-            workspace_root,
-            'item_calibration_file',
-            'item_detect.calibration_file',
-            'calibration_file',
-            'common.calibration_file',
-            path=True,
-        ),
+        'calibration_file': eye_to_hand_calibration_file,
+        'platform_calibration_file': platform_calibration_file,
         'parent_frame': _setting_with_fallback(
             context,
             settings,
@@ -535,20 +593,10 @@ def _launch_setup(context, *args, **kwargs):
     if _flag(context, settings, workspace_root, 'launch_item_detect', 'launch.item_detect'):
         item_detect_camera_args = dict(item_camera_args)
         item_detect_camera_args.pop('camera_control_service_root', None)
-        actions.append(_include('item_perception', 'item_detect.launch.py', {
+        actions.append(_include('item_perception_yolo', 'item_detect_yolo.launch.py', {
             'params_file': _optional_setting(context, settings, workspace_root, 'item_detect_params_file', 'item_detect.params_file', path=True),
             'profiles_dir': item_profiles_dir,
-            'selected_profile_path': _selected_profile_path(
-                context,
-                settings,
-                workspace_root,
-                mode,
-                'item_selected_profile_path',
-                'item_detect.selected_profile_path',
-                item_profiles_dir,
-                'item_detect',
-                'Item detect',
-            ),
+            'model_root': item_profiles_dir,
             'runtime_settings_file': _existing_file(
                 _setting(context, settings, workspace_root, 'item_detect_runtime_settings_file', 'item_detect.runtime_settings_file', path=True),
                 'Item detect runtime settings file',
@@ -667,7 +715,10 @@ def _launch_setup(context, *args, **kwargs):
             ),
             'robot_goal_frame_id': _setting(context, settings, workspace_root, 'robot_goal_frame_id', 'common.robot_goal_frame_id'),
             'robot_gripper_frame_id': _setting(context, settings, workspace_root, 'robot_gripper_frame_id', 'common.robot_gripper_frame_id'),
-            'camera_safety_frame_id': item_calibration_args['child_frame'],
+            'calibration_file': eye_to_hand_calibration_file,
+            'platform_calibration_file': platform_calibration_file,
+            'camera_safety_frame_id': common_calibration_args['child_frame'],
+            'camera_safety_calibration_file': item_pick_camera_safety_calibration_file,
             'tcp_pose_user': _optional_setting(context, settings, workspace_root, 'tcp_pose_user', 'common.tcp_pose_user') or '0',
             'tcp_pose_tool': _optional_setting(context, settings, workspace_root, 'tcp_pose_tool', 'common.tcp_pose_tool') or '0',
         }
@@ -676,9 +727,10 @@ def _launch_setup(context, *args, **kwargs):
         actions.append(_include('item_pick', 'item_pick.launch.py', item_pick_args))
 
     if _flag(context, settings, workspace_root, 'launch_tray_detect', 'launch.tray_detect'):
-        actions.append(_include('tray_perception', 'tray_detect.launch.py', {
+        actions.append(_include('tray_perception_yolo', 'tray_detect_yolo.launch.py', {
             'params_file': _optional_setting(context, settings, workspace_root, 'tray_detect_params_file', 'tray_detect.params_file', path=True),
             'profiles_dir': tray_profiles_dir,
+            'model_root': tray_profiles_dir,
             'selected_profile_path': _selected_profile_path(
                 context,
                 settings,
@@ -695,7 +747,15 @@ def _launch_setup(context, *args, **kwargs):
                 'Tray detect runtime settings file',
             ),
             'tray_pose_topic': _setting(context, settings, workspace_root, 'tray_pose_topic', 'tray_detect.pose_topic'),
-            'tray_vector_topic': _setting(context, settings, workspace_root, 'tray_vector_topic', 'tray_detect.vector_topic'),
+            'tray_target_pose_topic': _setting_with_fallback(
+                context,
+                settings,
+                workspace_root,
+                'tray_target_pose_topic',
+                'tray_detect.target_pose_topic',
+                'tray_vector_topic',
+                'tray_detect.vector_topic',
+            ),
             'start_visualization': start_visualization,
             'headless': 'true',
             **common_camera_args,
@@ -718,7 +778,15 @@ def _launch_setup(context, *args, **kwargs):
             ),
             'load_runtime_settings': load_runtime_settings,
             'motion_service_root': _setting(context, settings, workspace_root, 'motion_service_root', 'common.motion_service_root'),
-            'tray_vector_topic': _setting(context, settings, workspace_root, 'tray_vector_topic', 'tray_detect.vector_topic'),
+            'tray_target_pose_topic': _setting_with_fallback(
+                context,
+                settings,
+                workspace_root,
+                'tray_target_pose_topic',
+                'tray_detect.target_pose_topic',
+                'tray_vector_topic',
+                'tray_detect.vector_topic',
+            ),
             'tray_axis_overlay_topic': _setting(
                 context,
                 settings,
@@ -785,6 +853,14 @@ def generate_launch_description():
             'runtime_settings_file',
             default_value=_repo_path('config', 'robot_cell_orchestrator', 'robot_runtime_headless_settings.yaml'),
         ),
+        DeclareLaunchArgument(
+            'orchestrator_runtime_settings_file',
+            default_value=_repo_path(
+                'config',
+                'robot_cell_orchestrator',
+                'robot_cell_orchestrator_runtime_settings.yaml',
+            ),
+        ),
         *[
             _override_arg(name)
             for name in (
@@ -815,6 +891,7 @@ def generate_launch_description():
                 'calibration_file',
                 'calibration_parent_frame',
                 'calibration_child_frame',
+                'platform_calibration_file',
                 'camera_frame',
                 'robot_goal_frame_id',
                 'robot_gripper_frame_id',
@@ -823,7 +900,6 @@ def generate_launch_description():
                 'tcp_pose_tool',
                 'gripper_do_service',
                 'item_detect_params_file',
-                'item_selected_profile_path',
                 'item_detect_runtime_settings_file',
                 'item_selected_profile_export_file',
                 'item_color_topic',
@@ -847,6 +923,7 @@ def generate_launch_description():
                 'item_pick_start_sequence_service',
                 'item_pick_track_service',
                 'item_pick_track_status_service',
+                'camera_safety_calibration_file',
                 'item_pick_tf_only_mode',
                 'item_pose_wait_timeout_sec',
                 'item_pick_speed_mm_s',
@@ -862,6 +939,7 @@ def generate_launch_description():
                 'tray_selected_profile_path',
                 'tray_detect_runtime_settings_file',
                 'tray_pose_topic',
+                'tray_target_pose_topic',
                 'tray_vector_topic',
                 'tray_axis_overlay_topic',
                 'tray_dimensions_service',

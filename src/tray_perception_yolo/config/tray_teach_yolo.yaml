@@ -1,0 +1,12 @@
+tray_teach_yolo:
+  ros__parameters:
+    train_epochs: 80
+    train_imgsz: 640
+    train_device: "0"
+    train_use_gpu_if_available: true
+    yolo_base_model: third_party/yolo/checkpoints/yolo11n-seg.pt
+    yolo_preview_enabled: true
+    yolo_preview_conf: 0.35
+    yolo_preview_iou: 0.45
+    yolo_preview_imgsz: 640
+    yolo_preview_max_hz: 3.0
